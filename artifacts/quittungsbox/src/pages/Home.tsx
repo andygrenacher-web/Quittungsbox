@@ -63,7 +63,7 @@ export default function Home() {
 
       setScanStatus("PDF wird erstellt …");
       const pdfBlob = await generatePdfFromCanvas(canvas, ocrResult.rawText);
-      const fileName = buildFileName(paymentType, ocrResult.vendor, ocrResult.amount);
+      const fileName = buildFileName(paymentType, ocrResult.vendor, ocrResult.amount, ocrResult.receiptDate);
 
       setDone({ fileName, pdfBlob });
       setMode("done");

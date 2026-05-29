@@ -235,21 +235,69 @@ function warp(src: HTMLCanvasElement, quad: Quad, procScale: number): HTMLCanvas
 }
 
 // ── scan enhancement ───────────────────────────────────────
+// Uses adaptive thresholding (integral image → O(n) after O(n) setup).
+// Each pixel is compared to its local neighbourhood mean minus a constant C.
+// Result: clean black-on-white scan, dark backgrounds become white.
+
+function adaptiveThreshold(
+  gray: Uint8Array,
+  w: number, h: number,
+  blockSize = 31,  // odd, ~2% of typical receipt width
+  C = 12,          // subtract from local mean before comparison
+): Uint8Array {
+  // Build summed-area table (integral image) with 1-pixel border
+  const stride = w + 1;
+  const II = new Float64Array(stride * (h + 1));
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      II[(y + 1) * stride + (x + 1)] =
+        gray[y * w + x] +
+        II[y * stride + (x + 1)] +
+        II[(y + 1) * stride + x] -
+        II[y * stride + x];
+    }
+  }
+
+  const out = new Uint8Array(w * h);
+  const half = blockSize >> 1;
+
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const x1 = Math.max(0, x - half);
+      const y1 = Math.max(0, y - half);
+      const x2 = Math.min(w - 1, x + half);
+      const y2 = Math.min(h - 1, y + half);
+      const n = (x2 - x1 + 1) * (y2 - y1 + 1);
+      const sum =
+        II[(y2 + 1) * stride + (x2 + 1)] -
+        II[y1 * stride + (x2 + 1)] -
+        II[(y2 + 1) * stride + x1] +
+        II[y1 * stride + x1];
+      out[y * w + x] = gray[y * w + x] >= (sum / n - C) ? 255 : 0;
+    }
+  }
+  return out;
+}
 
 function enhance(canvas: HTMLCanvasElement): void {
   const ctx = canvas.getContext("2d")!;
   const img = ctx.getImageData(0, 0, canvas.width, canvas.height);
   const d = img.data;
+  const n = canvas.width * canvas.height;
 
-  for (let i = 0; i < d.length; i += 4) {
-    // Grayscale
-    let g = 0.299 * d[i] + 0.587 * d[i+1] + 0.114 * d[i+2];
-    // S-curve contrast: stretch [15..230] to [0..255]
-    g = Math.max(0, Math.min(255, (g - 15) * (255 / 215)));
-    // Smooth sigmoid boost
-    const t = g / 255;
-    const boosted = t * t * (3 - 2 * t); // smoothstep
-    d[i] = d[i+1] = d[i+2] = Math.round(boosted * 255);
+  // Step 1 – grayscale
+  const gray = new Uint8Array(n);
+  for (let i = 0, j = 0; j < n; i += 4, j++) {
+    gray[j] = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
+  }
+
+  // Step 2 – adaptive threshold
+  const bw = adaptiveThreshold(gray, canvas.width, canvas.height);
+
+  // Step 3 – write back as greyscale (keeps JPEG encoder happy vs pure 1-bit)
+  for (let i = 0, j = 0; j < n; i += 4, j++) {
+    d[i] = d[i + 1] = d[i + 2] = bw[j];
+    d[i + 3] = 255;
   }
 
   ctx.putImageData(img, 0, 0);
