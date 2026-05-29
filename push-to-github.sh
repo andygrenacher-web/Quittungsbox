@@ -2,7 +2,7 @@
 echo ""
 echo "=== Quittungsbox → GitHub pushen ==="
 echo ""
-echo "Token eingeben (wird nicht angezeigt):"
+echo "Neuen Token eingeben (wird nicht angezeigt):"
 read -rs TOKEN
 echo ""
 
@@ -11,10 +11,14 @@ if [ -z "$TOKEN" ]; then
   exit 1
 fi
 
-git remote set-url origin "https://${TOKEN}@github.com/andygrenacher-web/Quittungsbox.git"
-
 echo "Pushe zu GitHub..."
-git push -u origin main
+git push "https://${TOKEN}@github.com/andygrenacher-web/Quittungsbox.git" main
 
-echo ""
-echo "Fertig! Jetzt auf github.com/andygrenacher-web/Quittungsbox den Tab 'Actions' öffnen."
+if [ $? -eq 0 ]; then
+  echo ""
+  echo "✓ Erfolgreich! Jetzt auf GitHub Actions warten:"
+  echo "  https://github.com/andygrenacher-web/Quittungsbox/actions"
+else
+  echo ""
+  echo "✗ Fehler. Token ungültig oder abgelaufen?"
+fi
