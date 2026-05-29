@@ -235,45 +235,36 @@ function warp(src: HTMLCanvasElement, quad: Quad, procScale: number): HTMLCanvas
 }
 
 // ── scan enhancement ───────────────────────────────────────
-// Uses adaptive thresholding (integral image → O(n) after O(n) setup).
-// Each pixel is compared to its local neighbourhood mean minus a constant C.
-// Result: clean black-on-white scan, dark backgrounds become white.
+// Pipeline: grayscale → background normalisation → histogram stretch
+//           → gentle S-curve → unsharp mask
+// Produces a clean grey-tone scan without harsh B&W artefacts.
+// Shadows and creases are NOT amplified; wrinkled paper looks fine.
 
-function adaptiveThreshold(
-  gray: Uint8Array,
-  w: number, h: number,
-  blockSize = 31,  // odd, ~2% of typical receipt width
-  C = 12,          // subtract from local mean before comparison
-): Uint8Array {
-  // Build summed-area table (integral image) with 1-pixel border
+// Integral-image box blur – O(n) after O(n) setup, works for any radius.
+function boxBlur(src: Uint8Array | Float32Array, w: number, h: number, r: number): Float32Array {
   const stride = w + 1;
-  const II = new Float64Array(stride * (h + 1));
+  const II = new Float32Array(stride * (h + 1));
   for (let y = 0; y < h; y++) {
     for (let x = 0; x < w; x++) {
       II[(y + 1) * stride + (x + 1)] =
-        gray[y * w + x] +
+        src[y * w + x] +
         II[y * stride + (x + 1)] +
         II[(y + 1) * stride + x] -
         II[y * stride + x];
     }
   }
-
-  const out = new Uint8Array(w * h);
-  const half = blockSize >> 1;
-
+  const out = new Float32Array(w * h);
   for (let y = 0; y < h; y++) {
     for (let x = 0; x < w; x++) {
-      const x1 = Math.max(0, x - half);
-      const y1 = Math.max(0, y - half);
-      const x2 = Math.min(w - 1, x + half);
-      const y2 = Math.min(h - 1, y + half);
-      const n = (x2 - x1 + 1) * (y2 - y1 + 1);
-      const sum =
+      const x1 = Math.max(0, x - r),  y1 = Math.max(0, y - r);
+      const x2 = Math.min(w - 1, x + r), y2 = Math.min(h - 1, y + r);
+      const cnt = (x2 - x1 + 1) * (y2 - y1 + 1);
+      const s =
         II[(y2 + 1) * stride + (x2 + 1)] -
-        II[y1 * stride + (x2 + 1)] -
-        II[(y2 + 1) * stride + x1] +
-        II[y1 * stride + x1];
-      out[y * w + x] = gray[y * w + x] >= (sum / n - C) ? 255 : 0;
+        II[y1       * stride + (x2 + 1)] -
+        II[(y2 + 1) * stride + x1      ] +
+        II[y1       * stride + x1      ];
+      out[y * w + x] = s / cnt;
     }
   }
   return out;
@@ -282,24 +273,73 @@ function adaptiveThreshold(
 function enhance(canvas: HTMLCanvasElement): void {
   const ctx = canvas.getContext("2d")!;
   const img = ctx.getImageData(0, 0, canvas.width, canvas.height);
-  const d = img.data;
-  const n = canvas.width * canvas.height;
+  const d   = img.data;
+  const cw  = canvas.width, ch = canvas.height;
+  const n   = cw * ch;
 
-  // Step 1 – grayscale
+  // ① Grayscale (luminance weights)
   const gray = new Uint8Array(n);
   for (let i = 0, j = 0; j < n; i += 4, j++) {
-    gray[j] = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
+    gray[j] = (0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2]) | 0;
   }
 
-  // Step 2 – adaptive threshold
-  const bw = adaptiveThreshold(gray, canvas.width, canvas.height);
+  // ② Background estimation: large box blur (~5 % of image width)
+  //    Captures slow illumination changes (shadows, uneven lighting)
+  const bgR = Math.max(30, Math.round(Math.min(cw, ch) * 0.06));
+  const bg  = boxBlur(gray, cw, ch, bgR);
 
-  // Step 3 – write back as greyscale (keeps JPEG encoder happy vs pure 1-bit)
+  // ③ Local illumination normalisation: pixel / background × reference
+  //    Paper (high bg value) → maps to ~230; ink (low pixel) stays dark
+  const norm = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    norm[i] = Math.min(255, (gray[i] / Math.max(1, bg[i])) * 230);
+  }
+
+  // ④ Histogram stretch using 2 %–98 % percentile for robustness
+  const hist = new Uint32Array(256);
+  for (let i = 0; i < n; i++) hist[norm[i] | 0]++;
+  let lo = 0, hi = 255, cum = 0;
+  for (let v = 0; v < 256; v++) {
+    cum += hist[v];
+    if (cum <  n * 0.02) lo = v;
+    if (cum <= n * 0.98) hi = v;
+  }
+  const rng = (hi - lo) || 1;
+  const stretched = new Uint8Array(n);
+  for (let i = 0; i < n; i++) {
+    stretched[i] = Math.max(0, Math.min(255, (((norm[i] - lo) / rng) * 255) | 0));
+  }
+
+  // ⑤ Gentle LUT: mild gamma + soft S-curve – keeps grey tones, no hard clipping
+  const lut = new Uint8Array(256);
+  for (let v = 0; v < 256; v++) {
+    const t  = v / 255;
+    // Gamma 0.88 → slight overall brightening (paper becomes whiter)
+    const g  = Math.pow(t, 0.88);
+    // Soft S-curve: barely perceptible, avoids harsh contrast
+    const s  = g < 0.5
+      ? g * (1 + 0.3 * g)               // very mild lift in shadows
+      : 1 - (1 - g) * (1 + 0.3 * (1 - g)); // symmetrical in highlights
+    lut[v] = Math.max(0, Math.min(255, Math.round(s * 255)));
+  }
+  const curved = new Uint8Array(n);
+  for (let i = 0; i < n; i++) curved[i] = lut[stretched[i]];
+
+  // ⑥ Unsharp mask (radius 2, amount 1.3) – sharpens text edges
+  const smBlur = boxBlur(curved, cw, ch, 2);
+  const USM_AMOUNT = 1.3;
+  const result = new Uint8Array(n);
+  for (let i = 0; i < n; i++) {
+    result[i] = Math.max(0, Math.min(255,
+      Math.round(curved[i] + USM_AMOUNT * (curved[i] - smBlur[i]))
+    ));
+  }
+
+  // Write back as greyscale RGBA
   for (let i = 0, j = 0; j < n; i += 4, j++) {
-    d[i] = d[i + 1] = d[i + 2] = bw[j];
+    d[i] = d[i + 1] = d[i + 2] = result[j];
     d[i + 3] = 255;
   }
-
   ctx.putImageData(img, 0, 0);
 }
 
