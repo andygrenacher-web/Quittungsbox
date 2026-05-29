@@ -9,7 +9,10 @@ import { isNative } from "./platform";
 
 // ── shared types ────────────────────────────────────────────────────────────
 
-const MONTHS_DE = ["Jan","Feb","Mär","Apr","Mai","Jun","Jul","Aug","Sep","Okt","Nov","Dez"];
+const MONTHS_DE = [
+  "Januar","Februar","März","April","Mai","Juni",
+  "Juli","August","September","Oktober","November","Dezember",
+];
 
 export interface ReceiptRecord {
   id:          string;
@@ -29,6 +32,32 @@ export function getFolder(receiptDate: string | null, ocrFailed: boolean): strin
   const [y, m] = receiptDate.split("-");
   const mIdx   = Math.max(0, parseInt(m) - 1);
   return `Archiv/${y}/${m} ${MONTHS_DE[mIdx]}`;
+}
+
+// ── folder structure initialisation ─────────────────────────────────────────
+// Called once on app start. Creates the full visible folder tree in
+// Documents/Quittungsbox/ so it appears in Android "Meine Dateien".
+
+export async function initFolderStructure(): Promise<void> {
+  if (!isNative()) return;
+  const { Filesystem, Directory } = await import("@capacitor/filesystem");
+
+  const year = new Date().getFullYear();
+  const folders = [
+    "Quittungsbox/Prüfen/Kein Datum",
+    "Quittungsbox/Prüfen/Kein Betrag",
+    "Quittungsbox/Prüfen/OCR Fehler",
+    ...MONTHS_DE.map((name, i) => {
+      const m = String(i + 1).padStart(2, "0");
+      return `Quittungsbox/Archiv/${year}/${m} ${name}`;
+    }),
+  ];
+
+  for (const folder of folders) {
+    try {
+      await Filesystem.mkdir({ path: folder, directory: Directory.Documents, recursive: true });
+    } catch { /* folder already exists — ignore */ }
+  }
 }
 
 // ── public API ───────────────────────────────────────────────────────────────
@@ -169,7 +198,6 @@ function openDb(): Promise<IDBDatabase> {
 async function saveReceiptWeb(record: Omit<ReceiptRecord, "id"> & { pdfBlob: Blob }): Promise<string> {
   const db = await openDb();
   return new Promise((resolve, reject) => {
-    // Omit the `id` field — IDB will auto-assign a number
     const { id: _id, ...data } = record as ReceiptRecord;
     void _id;
     const req = db.transaction(STORE, "readwrite").objectStore(STORE).add(data);
@@ -206,7 +234,7 @@ function blobToBase64(blob: Blob): Promise<string> {
     const reader = new FileReader();
     reader.onload  = () => {
       const result = reader.result as string;
-      resolve(result.split(",")[1]); // strip "data:application/pdf;base64,"
+      resolve(result.split(",")[1]);
     };
     reader.onerror = () => reject(reader.error);
     reader.readAsDataURL(blob);

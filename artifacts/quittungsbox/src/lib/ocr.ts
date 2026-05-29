@@ -47,19 +47,49 @@ function isValidDate(d: Date): boolean {
 
 // ── amount extraction ────────────────────────────────────────────────────────
 
-const TOTAL_KW = /\b(Total|TOTAL|Betrag|Summe|Rechnungsbetrag|Gesamtbetrag|Gesamt|Endbetrag|Zahlung|Zahlen|Grand\s+total|ZU\s+ZAHLEN|ZU\s+BEZAHLEN|zu\s+bezahlen|zu\s+zahlen|Zu\s+zahlen|BEZAHLT|Bezahlt|Kassiert)\b|(?<!\w)CHF(?!\w)/i;
-const EXCL_KW  = /\b(Menge|Anzahl|Liter|Ltr\.?|kg|Stk\.?|Einzel|Grundpreis|Literpreis|Einheitspreis|MWST|MwSt)\b|\bpro\s+(kg|l|Ltr|Stk)\b|\/\s*(kg|l|Ltr)\b|\d+\s*[×xX*]\s*\d/i;
+// Strong total keywords: definitive payment lines
+const STRONG_TOTAL = /\b(Gesamttotal|Totalbetrag|Gesamtbetrag|Endbetrag|Rechnungsbetrag|ZU\s+ZAHLEN|ZU\s+BEZAHLEN|zu\s+bezahlen|zu\s+zahlen|Zu\s+zahlen|Zu\s+bezahlen|BEZAHLT|Bezahlt|Kassiert)\b/i;
+
+// Standard total keywords
+const TOTAL_KW = /\b(Total|TOTAL|Betrag|Summe|Gesamt|Zahlung|Zahlen|Grand\s+total)\b|(?<!\w)CHF(?!\w)/i;
+
+// Lines to EXCLUDE from amount detection.
+// Excludes: quantities, weights, volumes, tax, tank/pump specific, reference numbers,
+// unit prices, and cross-multiplication (e.g. "3 × 4.50").
+const EXCL_KW = new RegExp(
+  String.raw`\b(` +
+    // Quantities & units
+    String.raw`Menge|Anzahl|Liter|Ltr\.?|Lite?r|kg|g\b|Stk\.?|Stück|` +
+    // Price-per-unit
+    String.raw`Einzel|Grundpreis|Literpreis|Einheitspreis|` +
+    // Tax
+    String.raw`MWST|MwSt|USt|Ust\.|Steuer|` +
+    // Tank / fuel receipts
+    String.raw`Tankautomat|Zapfpunkt|Zapfsäule|` +
+    // Reference numbers
+    String.raw`Beleg[-\s]*Nr\.?|Art[-\s]*Nr\.?|Bon[-\s]*Nr\.?|` +
+    // Discount / deposit
+    String.raw`Rabatt|Pfand` +
+  String.raw`)\b` +
+  // Unit-price patterns: /l, /kg, pro l, ×/x quantity
+  String.raw`|\bpro\s+(kg|l|Ltr|Stk)\b` +
+  String.raw`|\/\s*(kg|l|Ltr)\b` +
+  String.raw`|\bPreis\s*\/` +
+  // Multiplication: "3 × 4.50" or "2 x 5.00"
+  String.raw`|\d+\s*[×xX\*]\s*\d`,
+  "i"
+);
 
 // Negative lookahead prevents "24.05" inside "24.05.2026" from matching as amount
 const AMT_G = /\b(\d{1,6}[.,]\d{2})\b(?![.\-\/]\d)/g;
 
 function parseAmt(s: string): number { return parseFloat(s.replace(",", ".")); }
 
-function allAmounts(line: string): number[] {
+function amountsOnLine(line: string): number[] {
   const out: number[] = [];
   for (const m of line.matchAll(AMT_G)) {
     const v = parseAmt(m[1]);
-    if (v > 0.01 && v < 100_000) out.push(v);
+    if (v >= 0.10 && v < 100_000) out.push(v);
   }
   return out;
 }
@@ -67,23 +97,43 @@ function allAmounts(line: string): number[] {
 function extractAmount(text: string): string | null {
   const lines = text.split("\n").map(l => l.trim()).filter(Boolean);
 
-  // Pass 1: keyword line → largest amount on that line
+  // Collect keyword-matching candidates with a priority score:
+  //   2 = strong total keyword (Gesamttotal, Zu bezahlen, …)
+  //   1 = standard keyword (Total, Betrag, CHF, …)
+  interface Candidate { priority: number; amounts: number[] }
+  const candidates: Candidate[] = [];
+
   for (const line of lines) {
-    if (!TOTAL_KW.test(line)) continue;
-    if (EXCL_KW.test(line))   continue;
-    const amts = allAmounts(line);
-    if (amts.length) return Math.max(...amts).toFixed(2);
+    if (EXCL_KW.test(line)) continue;
+    const amts = amountsOnLine(line);
+    if (!amts.length) continue;
+
+    if (STRONG_TOTAL.test(line)) {
+      candidates.push({ priority: 2, amounts: amts });
+    } else if (TOTAL_KW.test(line)) {
+      candidates.push({ priority: 1, amounts: amts });
+    }
   }
 
-  // Pass 2: bottom 40 % of receipt, non-excluded → largest
+  if (candidates.length) {
+    // Prefer strong-total lines; among equals take the LAST one
+    // (last "Total" line on a receipt is usually the final payable amount).
+    const best = candidates.filter(c => c.priority === Math.max(...candidates.map(x => x.priority)));
+    const pick = best[best.length - 1];
+    return Math.max(...pick.amounts).toFixed(2);
+  }
+
+  // Pass 2: bottom 40% of receipt, non-excluded → largest amount.
+  // Only use this if we find amounts on at most 3 distinct lines
+  // (avoids guessing when the tail is full of item prices).
   const tail      = lines.slice(Math.floor(lines.length * 0.60));
-  const tailCands = tail.flatMap(l => EXCL_KW.test(l) ? [] : allAmounts(l));
-  if (tailCands.length) return Math.max(...tailCands).toFixed(2);
+  const tailLines = tail.filter(l => !EXCL_KW.test(l) && amountsOnLine(l).length > 0);
+  if (tailLines.length > 0 && tailLines.length <= 4) {
+    const allAmts = tailLines.flatMap(l => amountsOnLine(l));
+    return Math.max(...allAmts).toFixed(2);
+  }
 
-  // Pass 3: any non-excluded line → largest
-  const allCands = lines.flatMap(l => EXCL_KW.test(l) ? [] : allAmounts(l));
-  if (allCands.length) return Math.max(...allCands).toFixed(2);
-
+  // Pass 3: too many candidates → don't guess, leave blank
   return null;
 }
 
@@ -117,9 +167,6 @@ export function parseOcrText(text: string) {
 }
 
 // ── public OCR API ───────────────────────────────────────────────────────────
-// Tesseract runs on both web and Android.
-// On Android, images come pre-corrected from ML Kit Document Scanner so OCR
-// quality is significantly better than raw camera shots.
 
 export async function runOcr(imageBlob: Blob): Promise<OcrResult> {
   try {
@@ -133,6 +180,9 @@ export async function runOcr(imageBlob: Blob): Promise<OcrResult> {
 }
 
 // ── filename builder ─────────────────────────────────────────────────────────
+// Format: YYYY-MM-DD_Betrag_Zahlungsart.pdf   (when amount known)
+//         YYYY-MM-DD_Zahlungsart.pdf           (when amount unknown)
+// If no receipt date: use today's scan date and route to Prüfen/Kein Datum.
 
 export function buildFileName(
   paymentType: "Bar" | "Karte",

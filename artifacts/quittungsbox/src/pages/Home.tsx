@@ -3,7 +3,7 @@ import { useLocation } from "wouter";
 import { scanImage, prepareScannedImage, canvasToBlob, canvasToDataUrl, applyOriginal, applyGrau, applyScan } from "@/lib/scanner";
 import { runOcr, buildFileName } from "@/lib/ocr";
 import { generatePdfFromCanvas } from "@/lib/pdf";
-import { saveReceipt, getPruefenCount, getFolder } from "@/lib/storage";
+import { saveReceipt, getPruefenCount, getFolder, initFolderStructure } from "@/lib/storage";
 import { capturePhoto } from "@/lib/capture";
 import { isNative } from "@/lib/platform";
 
@@ -46,7 +46,10 @@ export default function Home() {
     try { setPruefenCount(await getPruefenCount()); } catch { /* ignore */ }
   }
 
-  useEffect(() => { loadPruefenCount(); }, []);
+  useEffect(() => {
+    loadPruefenCount();
+    initFolderStructure().catch(() => {});
+  }, []);
 
   // ── mode switching ─────────────────────────────────────────
 
