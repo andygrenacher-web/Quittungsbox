@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { useLocation } from "wouter";
 import { getOpenAiKey, setOpenAiKey, isAiEnabled, setAiEnabled } from "@/lib/settings";
+import { testOpenAiKey, type AiTestResult } from "@/lib/ai-receipt";
 
 export default function Settings() {
   const [, setLocation] = useLocation();
@@ -10,11 +11,22 @@ export default function Settings() {
   const [showKey,   setShowKey]   = useState(false);
   const [saving,    setSaving]    = useState(false);
   const [savedMsg,  setSavedMsg]  = useState("");
+  const [testing,   setTesting]   = useState(false);
+  const [testResult, setTestResult] = useState<AiTestResult | null>(null);
 
   useEffect(() => {
     getOpenAiKey().then(k => setApiKey(k ?? ""));
     isAiEnabled().then(setAiOn);
   }, []);
+
+  async function handleTest() {
+    setTesting(true);
+    setTestResult(null);
+    await setOpenAiKey(apiKey.trim() || null);  // persist before testing
+    const result = await testOpenAiKey(apiKey);
+    setTestResult(result);
+    setTesting(false);
+  }
 
   async function handleSave() {
     setSaving(true);
@@ -137,6 +149,43 @@ export default function Settings() {
                 {hasKey ? "API-Key vorhanden" : "Kein API-Key — KI deaktiviert"}
               </span>
             </div>
+
+            {/* Test button */}
+            <button
+              onClick={handleTest}
+              disabled={testing || !hasKey}
+              className="w-full py-2.5 rounded-xl text-sm font-semibold flex items-center justify-center gap-2 active:scale-[0.97] transition-transform border-2 disabled:opacity-40"
+              style={{ borderColor: "hsl(221 80% 52%)", color: "hsl(221 80% 45%)" }}
+            >
+              {testing ? (
+                <>
+                  <svg className="animate-spin" width="15" height="15" viewBox="0 0 24 24" fill="none">
+                    <circle cx="12" cy="12" r="10" stroke="currentColor" strokeOpacity="0.25" strokeWidth="3"/>
+                    <path d="M12 2a10 10 0 0 1 10 10" stroke="currentColor" strokeWidth="3" strokeLinecap="round"/>
+                  </svg>
+                  KI wird getestet …
+                </>
+              ) : (
+                <>
+                  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                    <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22,4 12,14.01 9,11.01"/>
+                  </svg>
+                  KI jetzt testen
+                </>
+              )}
+            </button>
+
+            {/* Test result */}
+            {testResult && (
+              <div className="rounded-xl px-3 py-2.5 text-xs leading-relaxed flex items-start gap-2"
+                style={{
+                  background: testResult.ok ? "hsl(142 55% 36% / 0.10)" : "hsl(0 84% 60% / 0.10)",
+                  color:      testResult.ok ? "hsl(142 55% 26%)"        : "hsl(0 72% 42%)",
+                }}>
+                <span className="shrink-0 font-bold">{testResult.ok ? "✓" : "✗"}</span>
+                <span>{testResult.message}</span>
+              </div>
+            )}
 
             {/* Pricing note */}
             <p className="text-xs text-muted-foreground leading-relaxed">

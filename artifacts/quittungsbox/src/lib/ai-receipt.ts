@@ -104,3 +104,65 @@ function isAllowedYear(dateStr: string): boolean {
   const curr = new Date().getFullYear();
   return year >= curr - 2 && year <= curr;
 }
+
+// ── Connectivity / key test ──────────────────────────────────────────────────
+// Makes a minimal real request so the user can see EXACTLY why AI fails:
+// missing key, invalid key, no quota, network/CORS, or timeout.
+
+export interface AiTestResult {
+  ok:      boolean;
+  message: string;
+}
+
+export async function testOpenAiKey(apiKey: string): Promise<AiTestResult> {
+  const key = apiKey.trim();
+  if (!key) return { ok: false, message: "Kein API-Key eingegeben." };
+  if (!key.startsWith("sk-")) {
+    return { ok: false, message: 'API-Key sieht ungültig aus (muss mit "sk-" beginnen).' };
+  }
+  if (!navigator.onLine) {
+    return { ok: false, message: "Keine Internetverbindung." };
+  }
+
+  try {
+    const res = await fetch("https://api.openai.com/v1/chat/completions", {
+      method:  "POST",
+      headers: {
+        "Content-Type":  "application/json",
+        "Authorization": `Bearer ${key}`,
+      },
+      body: JSON.stringify({
+        model:                "gpt-4o-mini",
+        max_completion_tokens: 5,
+        messages: [{ role: "user", content: "ping" }],
+      }),
+      signal: AbortSignal.timeout(15_000),
+    });
+
+    if (res.ok) {
+      return { ok: true, message: "KI funktioniert ✓ — Key gültig, Verbindung OK." };
+    }
+
+    let detail = "";
+    try {
+      const err = await res.json() as { error?: { message?: string } };
+      detail = err.error?.message ?? "";
+    } catch { /* non-JSON error body */ }
+
+    if (res.status === 401) return { ok: false, message: "Ungültiger API-Key (401). Bitte Key prüfen." };
+    if (res.status === 429) return { ok: false, message: "Kein Guthaben oder Limit erreicht (429). OpenAI-Konto / Billing prüfen." };
+    if (res.status === 403) return { ok: false, message: "Zugriff verweigert (403). Key-Berechtigung prüfen." };
+    if (res.status === 404) return { ok: false, message: "Modell nicht verfügbar (404)." };
+    return { ok: false, message: `Fehler ${res.status}${detail ? ": " + detail : ""}` };
+
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    if (/abort|timeout|time/i.test(msg)) {
+      return { ok: false, message: "Zeitüberschreitung — keine Antwort von OpenAI." };
+    }
+    return {
+      ok: false,
+      message: "Netzwerkfehler — keine Verbindung zu OpenAI (Internet/CORS/Firewall).",
+    };
+  }
+}
