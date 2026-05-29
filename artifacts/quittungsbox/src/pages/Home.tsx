@@ -6,6 +6,8 @@ import { generatePdfFromCanvas } from "@/lib/pdf";
 import { saveReceipt, getPruefenCount, getFolder, initFolderStructure } from "@/lib/storage";
 import { capturePhoto } from "@/lib/capture";
 import { isNative } from "@/lib/platform";
+import { getOpenAiKey, isAiEnabled } from "@/lib/settings";
+import { analyzeReceiptWithAi } from "@/lib/ai-receipt";
 
 type PaymentType  = "Bar" | "Karte";
 type AppMode      = "idle" | "scanning" | "preview" | "processing" | "done" | "error";
@@ -15,6 +17,7 @@ interface DoneState {
   fileName: string;
   folder:   string;
   pdfBlob:  Blob;
+  aiUsed:   boolean;
 }
 
 const MODES: { id: DisplayMode; label: string; hint: string }[] = [
@@ -35,6 +38,7 @@ export default function Home() {
   const [done,         setDone]         = useState<DoneState | null>(null);
   const [errorMsg,     setErrorMsg]     = useState("");
   const [pruefenCount, setPruefenCount] = useState(0);
+  const [aiConfigured, setAiConfigured] = useState(false);
 
   const rawCanvasRef     = useRef<HTMLCanvasElement | null>(null);
   const ocrCanvasRef     = useRef<HTMLCanvasElement | null>(null);
@@ -49,6 +53,8 @@ export default function Home() {
   useEffect(() => {
     loadPruefenCount();
     initFolderStructure().catch(() => {});
+    // Check if AI key is configured for header badge
+    getOpenAiKey().then(k => setAiConfigured(!!k));
   }, []);
 
   // ── mode switching ─────────────────────────────────────────
@@ -71,8 +77,6 @@ export default function Home() {
     setAppMode("scanning");
     setScanStatus(alreadyCorrected ? "Bild wird verarbeitet …" : "Beleg wird erkannt …");
     try {
-      // When ML Kit Document Scanner was used, skip our canvas-based detection
-      // (the image is already cropped + perspective-corrected).
       const { rawCanvas, canvas: grauCanvas, corrected: cor } = alreadyCorrected
         ? await prepareScannedImage(imageBlob)
         : await scanImage(imageBlob);
@@ -90,18 +94,16 @@ export default function Home() {
     }
   }
 
-  // ── native camera (Android / Capacitor) ───────────────────
+  // ── native camera ──────────────────────────────────────────
 
   async function captureNative(pt: PaymentType) {
     try {
       const result = await capturePhoto();
-      if (!result) return; // user cancelled
+      if (!result) return;
       handleCapture(pt, result.blob, result.alreadyCorrected);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      // Silently ignore genuine cancellations
       if (/cancelled|cancel|dismiss/i.test(msg)) return;
-      // Show all other errors so we can diagnose
       setErrorMsg("Kamera-Fehler: " + msg);
       setAppMode("error");
     }
@@ -118,39 +120,61 @@ export default function Home() {
   }
 
   function triggerCapture(pt: PaymentType) {
-    if (isNative()) {
-      captureNative(pt);
-    } else {
-      if (pt === "Bar")   barRef.current?.click();
-      else                karteRef.current?.click();
-    }
+    if (isNative()) captureNative(pt);
+    else if (pt === "Bar") barRef.current?.click();
+    else                   karteRef.current?.click();
   }
 
-  // ── save (OCR on grau canvas, PDF on display-mode canvas) ─
+  // ── save — local OCR → optional AI → PDF → archive ────────
 
   async function handleSave() {
     if (!displayCanvasRef.current || !ocrCanvasRef.current || !paymentType) return;
     setAppMode("processing");
-    setScanStatus(isNative() ? "ML Kit OCR läuft …" : "OCR läuft …");
+    setScanStatus("OCR läuft …");
+
     try {
       const ocrBlob   = await canvasToBlob(ocrCanvasRef.current);
       const ocrResult = await runOcr(ocrBlob);
 
+      // ── optional AI enrichment ─────────────────────────────
+      // Always saves locally first. AI only improves filename/folder when:
+      //   - AI is enabled in settings
+      //   - an API key is present
+      //   - device is online
+      //   - AI returns high confidence (date AND amount both clearly found)
+      let finalDate   = ocrResult.receiptDate;
+      let finalAmount = ocrResult.amount;
+      let aiUsed      = false;
+
+      if (navigator.onLine && ocrResult.rawText.trim()) {
+        const [apiKey, aiOn] = await Promise.all([getOpenAiKey(), isAiEnabled()]);
+        if (apiKey && aiOn) {
+          setScanStatus("KI analysiert …");
+          const ai = await analyzeReceiptWithAi(ocrResult.rawText, apiKey);
+          if (ai && ai.confidence === "high") {
+            if (ai.date)   finalDate   = ai.date;
+            if (ai.amount) finalAmount = ai.amount;
+            aiUsed = true;
+          }
+        }
+      }
+
+      // ── build PDF and persist ──────────────────────────────
       setScanStatus("PDF wird erstellt …");
       const pdfBlob  = await generatePdfFromCanvas(displayCanvasRef.current, ocrResult.rawText);
-      const fileName = buildFileName(paymentType, ocrResult.vendor, ocrResult.amount, ocrResult.receiptDate);
-      const folder   = getFolder(ocrResult.receiptDate, ocrResult.ocrFailed);
+      const fileName = buildFileName(paymentType, ocrResult.vendor, finalAmount, finalDate);
+      const folder   = getFolder(finalDate, ocrResult.ocrFailed);
 
       await saveReceipt({
         fileName, folder, pdfBlob,
         createdAt:   new Date().toISOString(),
-        receiptDate: ocrResult.receiptDate,
-        amount:      ocrResult.amount,
+        receiptDate: finalDate,
+        amount:      finalAmount,
         paymentType, ocrFailed: ocrResult.ocrFailed,
       });
 
       await loadPruefenCount();
-      setDone({ fileName, folder, pdfBlob });
+      setDone({ fileName, folder, pdfBlob, aiUsed });
       setAppMode("done");
     } catch {
       setErrorMsg("PDF konnte nicht erstellt werden.");
@@ -163,7 +187,7 @@ export default function Home() {
   function downloadPdf() {
     if (!done) return;
     const url = URL.createObjectURL(done.pdfBlob);
-    const a = document.createElement("a"); a.href=url; a.download=done.fileName; a.click();
+    const a = document.createElement("a"); a.href = url; a.download = done.fileName; a.click();
     setTimeout(() => URL.revokeObjectURL(url), 5000);
   }
 
@@ -204,20 +228,37 @@ export default function Home() {
             {isNative() ? "Android · ML Kit OCR · Lokal" : "Beleg fotografieren, fertig."}
           </p>
         </div>
-        <button onClick={() => setLocation("/archiv")}
-          className="relative h-9 px-3 rounded-xl bg-muted flex items-center gap-1.5 active:bg-accent text-sm font-medium text-foreground">
-          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-            <polyline points="21,8 21,21 3,21 3,8"/><rect x="1" y="3" width="22" height="5"/>
-            <line x1="10" y1="12" x2="14" y2="12"/>
-          </svg>
-          Archiv
-          {pruefenCount > 0 && (
-            <span className="absolute -top-1.5 -right-1.5 min-w-[18px] h-[18px] rounded-full text-[10px] font-bold flex items-center justify-center px-1"
-              style={{ background: "hsl(30 90% 55%)", color: "white" }}>
-              {pruefenCount}
-            </span>
-          )}
-        </button>
+        <div className="flex items-center gap-2">
+          {/* Settings button */}
+          <button onClick={() => setLocation("/einstellungen")}
+            className="relative w-9 h-9 rounded-xl bg-muted flex items-center justify-center active:bg-accent"
+            title="Einstellungen">
+            <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <circle cx="12" cy="12" r="3"/>
+              <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+            </svg>
+            {/* Green dot when AI is configured */}
+            {aiConfigured && (
+              <span className="absolute -top-1 -right-1 w-2.5 h-2.5 rounded-full border-2 border-background"
+                style={{ background: "hsl(142 55% 36%)" }} />
+            )}
+          </button>
+          {/* Archive button */}
+          <button onClick={() => setLocation("/archiv")}
+            className="relative h-9 px-3 rounded-xl bg-muted flex items-center gap-1.5 active:bg-accent text-sm font-medium text-foreground">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <polyline points="21,8 21,21 3,21 3,8"/><rect x="1" y="3" width="22" height="5"/>
+              <line x1="10" y1="12" x2="14" y2="12"/>
+            </svg>
+            Archiv
+            {pruefenCount > 0 && (
+              <span className="absolute -top-1.5 -right-1.5 min-w-[18px] h-[18px] rounded-full text-[10px] font-bold flex items-center justify-center px-1"
+                style={{ background: "hsl(30 90% 55%)", color: "white" }}>
+                {pruefenCount}
+              </span>
+            )}
+          </button>
+        </div>
       </header>
 
       <main className="flex-1 flex flex-col justify-center px-5 gap-4 pb-8">
@@ -254,7 +295,6 @@ export default function Home() {
               <span className="text-white/70 text-sm">EC / Kredit</span>
             </button>
 
-            {/* Web-only hidden file inputs */}
             {!isNative() && (
               <>
                 <input ref={barRef}   type="file" accept="image/*" capture="environment" className="hidden" onChange={onFileChange("Bar")} />
@@ -355,13 +395,24 @@ export default function Home() {
             <div className="text-center">
               <p className="text-3xl font-bold text-foreground">Abgelegt</p>
               <p className="text-xs text-muted-foreground mt-2 px-4 font-mono break-all">{done.fileName}</p>
-              <div className="inline-flex items-center gap-1.5 mt-2 px-3 py-1 rounded-full"
-                style={{
-                  background: done.folder.startsWith("Prüfen") ? "hsl(45 100% 93%)" : "hsl(142 55% 36% / 0.1)",
-                  color:      done.folder.startsWith("Prüfen") ? "hsl(30 80% 35%)"  : "hsl(142 55% 28%)",
-                }}>
-                <span className="text-xs">{done.folder.startsWith("Prüfen") ? "⚠️" : "📁"}</span>
-                <span className="text-xs font-medium">{done.folder}</span>
+              <div className="flex items-center justify-center gap-2 mt-2 flex-wrap">
+                <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full"
+                  style={{
+                    background: done.folder.startsWith("Prüfen") ? "hsl(45 100% 93%)" : "hsl(142 55% 36% / 0.1)",
+                    color:      done.folder.startsWith("Prüfen") ? "hsl(30 80% 35%)"  : "hsl(142 55% 28%)",
+                  }}>
+                  <span className="text-xs">{done.folder.startsWith("Prüfen") ? "⚠️" : "📁"}</span>
+                  <span className="text-xs font-medium">{done.folder}</span>
+                </div>
+                {done.aiUsed && (
+                  <div className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full"
+                    style={{ background: "hsl(258 80% 55% / 0.10)", color: "hsl(258 80% 45%)" }}>
+                    <svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor">
+                      <path d="M12 2l2.4 7.4H22l-6.2 4.5 2.4 7.4L12 17l-6.2 4.3 2.4-7.4L2 9.4h7.6z"/>
+                    </svg>
+                    <span className="text-[11px] font-medium">KI</span>
+                  </div>
+                )}
               </div>
               {isNative() && (
                 <p className="text-xs text-muted-foreground mt-2">
@@ -421,7 +472,11 @@ export default function Home() {
       {appMode === "idle" && (
         <footer className="px-5 pb-6 text-center">
           <p className="text-xs text-muted-foreground">
-            {isNative() ? "Alles lokal · Android APK · ML Kit OCR" : "Alles lokal · Kein Server · Kein Konto"}
+            {aiConfigured
+              ? "KI-Auswertung aktiv · Alles lokal · Kein Konto"
+              : isNative()
+                ? "Alles lokal · Android APK · ML Kit OCR"
+                : "Alles lokal · Kein Server · Kein Konto"}
           </p>
         </footer>
       )}
