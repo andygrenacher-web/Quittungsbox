@@ -3,7 +3,7 @@ import { useLocation } from "wouter";
 import { scanImage, prepareScannedImage, canvasToBlob, canvasToDataUrl, applyOriginal, applyGrau, applyScan } from "@/lib/scanner";
 import { runOcr, buildFileName } from "@/lib/ocr";
 import { generatePdfFromCanvas } from "@/lib/pdf";
-import { saveReceipt, getPruefenCount, getFolder, initFolderStructure } from "@/lib/storage";
+import { saveReceipt, getPruefenCount, getFolder, initFolderStructure, moveReceiptFile } from "@/lib/storage";
 import { capturePhoto } from "@/lib/capture";
 import { isNative } from "@/lib/platform";
 import { getOpenAiKey, isAiEnabled } from "@/lib/settings";
@@ -17,7 +17,6 @@ interface DoneState {
   fileName: string;
   folder:   string;
   pdfBlob:  Blob;
-  aiUsed:   boolean;
 }
 
 const MODES: { id: DisplayMode; label: string; hint: string }[] = [
@@ -25,6 +24,36 @@ const MODES: { id: DisplayMode; label: string; hint: string }[] = [
   { id: "grau",     label: "Graustufen",  hint: "Standard" },
   { id: "scan",     label: "Scan",        hint: "Höherer Kontrast" },
 ];
+
+// ── Background AI enrichment ─────────────────────────────────────────────────
+// Called after the PDF is already saved. Runs silently; never blocks the UI.
+// If AI extracts a better date/amount, it renames the file in-place.
+async function runBackgroundAi(
+  savedFolder:   string,
+  savedFileName: string,
+  rawText:       string,
+  paymentType:   PaymentType,
+  pdfBlob:       Blob,
+): Promise<void> {
+  try {
+    if (!navigator.onLine || !rawText.trim()) return;
+    const [apiKey, aiOn] = await Promise.all([getOpenAiKey(), isAiEnabled()]);
+    if (!apiKey || !aiOn) return;
+
+    const ai = await analyzeReceiptWithAi(rawText, apiKey);
+    if (!ai || ai.confidence !== "high") return;
+
+    const newFileName = buildFileName(paymentType, null, ai.amount, ai.date);
+    const newFolder   = getFolder(ai.date, false);
+
+    // Only move if there is a genuine improvement
+    if (newFileName === savedFileName && newFolder === savedFolder) return;
+
+    await moveReceiptFile(savedFolder, savedFileName, newFolder, newFileName, pdfBlob);
+  } catch { /* silent — background task must never crash the app */ }
+}
+
+// ── Component ─────────────────────────────────────────────────────────────────
 
 export default function Home() {
   const [, setLocation] = useLocation();
@@ -53,11 +82,10 @@ export default function Home() {
   useEffect(() => {
     loadPruefenCount();
     initFolderStructure().catch(() => {});
-    // Check if AI key is configured for header badge
     getOpenAiKey().then(k => setAiConfigured(!!k));
   }, []);
 
-  // ── mode switching ─────────────────────────────────────────
+  // ── display mode switching ────────────────────────────────
 
   function switchMode(mode: DisplayMode) {
     if (!rawCanvasRef.current) return;
@@ -70,7 +98,7 @@ export default function Home() {
     setDisplayMode(mode);
   }
 
-  // ── capture ────────────────────────────────────────────────
+  // ── capture ───────────────────────────────────────────────
 
   async function handleCapture(pt: PaymentType, imageBlob: Blob, alreadyCorrected = false) {
     setPaymentType(pt);
@@ -94,8 +122,6 @@ export default function Home() {
     }
   }
 
-  // ── native camera ──────────────────────────────────────────
-
   async function captureNative(pt: PaymentType) {
     try {
       const result = await capturePhoto();
@@ -108,8 +134,6 @@ export default function Home() {
       setAppMode("error");
     }
   }
-
-  // ── web file input ─────────────────────────────────────────
 
   function onFileChange(pt: PaymentType) {
     return (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -125,7 +149,7 @@ export default function Home() {
     else                   karteRef.current?.click();
   }
 
-  // ── save — local OCR → optional AI → PDF → archive ────────
+  // ── save — OCR → PDF → persist → done → AI in background ─
 
   async function handleSave() {
     if (!displayCanvasRef.current || !ocrCanvasRef.current || !paymentType) return;
@@ -133,56 +157,42 @@ export default function Home() {
     setScanStatus("OCR läuft …");
 
     try {
+      // 1. OCR (local, always)
       const ocrBlob   = await canvasToBlob(ocrCanvasRef.current);
       const ocrResult = await runOcr(ocrBlob);
 
-      // ── optional AI enrichment ─────────────────────────────
-      // Always saves locally first. AI only improves filename/folder when:
-      //   - AI is enabled in settings
-      //   - an API key is present
-      //   - device is online
-      //   - AI returns high confidence (date AND amount both clearly found)
-      let finalDate   = ocrResult.receiptDate;
-      let finalAmount = ocrResult.amount;
-      let aiUsed      = false;
-
-      if (navigator.onLine && ocrResult.rawText.trim()) {
-        const [apiKey, aiOn] = await Promise.all([getOpenAiKey(), isAiEnabled()]);
-        if (apiKey && aiOn) {
-          setScanStatus("KI analysiert …");
-          const ai = await analyzeReceiptWithAi(ocrResult.rawText, apiKey);
-          if (ai && ai.confidence === "high") {
-            if (ai.date)   finalDate   = ai.date;
-            if (ai.amount) finalAmount = ai.amount;
-            aiUsed = true;
-          }
-        }
-      }
-
-      // ── build PDF and persist ──────────────────────────────
+      // 2. Build filename + folder from OCR result (may be refined by AI later)
       setScanStatus("PDF wird erstellt …");
       const pdfBlob  = await generatePdfFromCanvas(displayCanvasRef.current, ocrResult.rawText);
-      const fileName = buildFileName(paymentType, ocrResult.vendor, finalAmount, finalDate);
-      const folder   = getFolder(finalDate, ocrResult.ocrFailed);
+      const fileName = buildFileName(paymentType, ocrResult.vendor, ocrResult.amount, ocrResult.receiptDate);
+      const folder   = getFolder(ocrResult.receiptDate, ocrResult.ocrFailed);
 
+      // 3. Save immediately — user sees done screen right away
       await saveReceipt({
         fileName, folder, pdfBlob,
         createdAt:   new Date().toISOString(),
-        receiptDate: finalDate,
-        amount:      finalAmount,
-        paymentType, ocrFailed: ocrResult.ocrFailed,
+        receiptDate: ocrResult.receiptDate,
+        amount:      ocrResult.amount,
+        paymentType,
+        ocrFailed:   ocrResult.ocrFailed,
       });
 
       await loadPruefenCount();
-      setDone({ fileName, folder, pdfBlob, aiUsed });
+      setDone({ fileName, folder, pdfBlob });
       setAppMode("done");
+
+      // 4. AI enrichment runs in background — fire and forget.
+      //    If it improves date/amount, it renames the file silently.
+      //    The user sees the improved name next time they open the archive.
+      void runBackgroundAi(folder, fileName, ocrResult.rawText, paymentType, pdfBlob);
+
     } catch {
       setErrorMsg("PDF konnte nicht erstellt werden.");
       setAppMode("error");
     }
   }
 
-  // ── download / share ───────────────────────────────────────
+  // ── download / share ──────────────────────────────────────
 
   function downloadPdf() {
     if (!done) return;
@@ -206,7 +216,7 @@ export default function Home() {
     setDisplayMode("grau");
   }
 
-  // ── render ─────────────────────────────────────────────────
+  // ── render ────────────────────────────────────────────────
 
   return (
     <div className="flex flex-col min-h-dvh bg-background select-none">
@@ -229,7 +239,6 @@ export default function Home() {
           </p>
         </div>
         <div className="flex items-center gap-2">
-          {/* Settings button */}
           <button onClick={() => setLocation("/einstellungen")}
             className="relative w-9 h-9 rounded-xl bg-muted flex items-center justify-center active:bg-accent"
             title="Einstellungen">
@@ -237,13 +246,11 @@ export default function Home() {
               <circle cx="12" cy="12" r="3"/>
               <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
             </svg>
-            {/* Green dot when AI is configured */}
             {aiConfigured && (
               <span className="absolute -top-1 -right-1 w-2.5 h-2.5 rounded-full border-2 border-background"
                 style={{ background: "hsl(142 55% 36%)" }} />
             )}
           </button>
-          {/* Archive button */}
           <button onClick={() => setLocation("/archiv")}
             className="relative h-9 px-3 rounded-xl bg-muted flex items-center gap-1.5 active:bg-accent text-sm font-medium text-foreground">
             <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
@@ -393,30 +400,24 @@ export default function Home() {
               </svg>
             </div>
             <div className="text-center">
-              <p className="text-3xl font-bold text-foreground">Abgelegt</p>
+              <p className="text-3xl font-bold text-foreground">Gespeichert</p>
               <p className="text-xs text-muted-foreground mt-2 px-4 font-mono break-all">{done.fileName}</p>
-              <div className="flex items-center justify-center gap-2 mt-2 flex-wrap">
-                <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full"
-                  style={{
-                    background: done.folder.startsWith("Prüfen") ? "hsl(45 100% 93%)" : "hsl(142 55% 36% / 0.1)",
-                    color:      done.folder.startsWith("Prüfen") ? "hsl(30 80% 35%)"  : "hsl(142 55% 28%)",
-                  }}>
-                  <span className="text-xs">{done.folder.startsWith("Prüfen") ? "⚠️" : "📁"}</span>
-                  <span className="text-xs font-medium">{done.folder}</span>
-                </div>
-                {done.aiUsed && (
-                  <div className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full"
-                    style={{ background: "hsl(258 80% 55% / 0.10)", color: "hsl(258 80% 45%)" }}>
-                    <svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor">
-                      <path d="M12 2l2.4 7.4H22l-6.2 4.5 2.4 7.4L12 17l-6.2 4.3 2.4-7.4L2 9.4h7.6z"/>
-                    </svg>
-                    <span className="text-[11px] font-medium">KI</span>
-                  </div>
-                )}
+              <div className="inline-flex items-center gap-1.5 mt-2 px-3 py-1 rounded-full"
+                style={{
+                  background: done.folder.startsWith("Prüfen") ? "hsl(45 100% 93%)" : "hsl(142 55% 36% / 0.1)",
+                  color:      done.folder.startsWith("Prüfen") ? "hsl(30 80% 35%)"  : "hsl(142 55% 28%)",
+                }}>
+                <span className="text-xs">{done.folder.startsWith("Prüfen") ? "⚠️" : "📁"}</span>
+                <span className="text-xs font-medium">{done.folder}</span>
               </div>
+              {aiConfigured && navigator.onLine && (
+                <p className="text-[11px] text-muted-foreground mt-2">
+                  KI verfeinert Dateiname im Hintergrund …
+                </p>
+              )}
               {isNative() && (
-                <p className="text-xs text-muted-foreground mt-2">
-                  Gespeichert unter Dokumente/Quittungsbox/
+                <p className="text-xs text-muted-foreground mt-1">
+                  Dokumente/Quittungsbox/{done.folder}/
                 </p>
               )}
             </div>

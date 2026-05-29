@@ -1,13 +1,23 @@
 // Unified storage layer.
-// On Android (Capacitor native):
-//   – PDFs   → Capacitor Filesystem  (Documents/Quittungsbox/…)
-//   – Meta   → Capacitor Preferences (JSON array)
-// On web / Replit PWA:
-//   – everything stays in IndexedDB (original behaviour)
+//
+// Architecture decision — single source of truth:
+//   On Android: PDFs live in Documents/Quittungsbox/{folder}/{fileName}.
+//               The app SCANS the filesystem on every archive load.
+//               No separate Preferences store is needed — the file IS the record.
+//               Metadata is reconstructed from path + filename.
+//
+//   On web: everything stays in IndexedDB (unchanged).
+//
+// Filename format (never changes — parsing depends on it):
+//   {YYYY-MM-DD | unbekannt-{ts}}[_{amount}]_{Bar|Karte}.pdf
+//   Examples:
+//     2025-03-20_112.80_Bar.pdf
+//     2025-03-20_Karte.pdf
+//     unbekannt-1234567890_Bar.pdf
 
 import { isNative } from "./platform";
 
-// ── shared types ────────────────────────────────────────────────────────────
+// ── shared types ─────────────────────────────────────────────────────────────
 
 const MONTHS_DE = [
   "Januar","Februar","März","April","Mai","Juni",
@@ -18,7 +28,7 @@ export interface ReceiptRecord {
   id:          string;
   fileName:    string;
   folder:      string;      // e.g. "Archiv/2026/05 Mai" or "Prüfen/Kein Datum"
-  pdfBlob?:    Blob;        // present immediately on web; lazy on Android
+  pdfBlob?:    Blob;        // present on web (IndexedDB); never on Android (lazy)
   createdAt:   string;      // ISO timestamp
   receiptDate: string | null;
   amount:      string | null;
@@ -34,15 +44,13 @@ export function getFolder(receiptDate: string | null, ocrFailed: boolean): strin
   return `Archiv/${y}/${m} ${MONTHS_DE[mIdx]}`;
 }
 
-// ── folder structure initialisation ─────────────────────────────────────────
-// Called once on app start. Creates the full visible folder tree in
-// Documents/Quittungsbox/ so it appears in Android "Meine Dateien".
+// ── folder structure initialisation ──────────────────────────────────────────
 
 export async function initFolderStructure(): Promise<void> {
   if (!isNative()) return;
   const { Filesystem, Directory } = await import("@capacitor/filesystem");
 
-  const curr = new Date().getFullYear();
+  const curr       = new Date().getFullYear();
   const validYears = [curr - 2, curr - 1, curr];
 
   const monthFolders = validYears.flatMap(year =>
@@ -52,34 +60,33 @@ export async function initFolderStructure(): Promise<void> {
     })
   );
 
-  const folders = [
+  for (const folder of [
     "Quittungsbox/Prüfen/Kein Datum",
     "Quittungsbox/Prüfen/Kein Betrag",
     "Quittungsbox/Prüfen/OCR Fehler",
     ...monthFolders,
-  ];
-
-  for (const folder of folders) {
+  ]) {
     try {
       await Filesystem.mkdir({ path: folder, directory: Directory.Documents, recursive: true });
-    } catch { /* folder already exists — ignore */ }
+    } catch { /* already exists */ }
   }
 }
 
-// ── public API ───────────────────────────────────────────────────────────────
+// ── public API ────────────────────────────────────────────────────────────────
 
-export async function saveReceipt(record: Omit<ReceiptRecord, "id"> & { pdfBlob: Blob }): Promise<string> {
+export async function saveReceipt(
+  record: Omit<ReceiptRecord, "id"> & { pdfBlob: Blob }
+): Promise<string> {
   if (isNative()) return saveReceiptNative(record);
   return saveReceiptWeb(record);
 }
 
 export async function getAllReceipts(): Promise<ReceiptRecord[]> {
-  if (isNative()) return getAllReceiptsNative();
+  if (isNative()) return scanFilesystem();
   return getAllReceiptsWeb();
 }
 
-/** Load the PDF blob for a record. On web the blob is already present;
- *  on Android it reads from the Filesystem on demand. */
+/** Load the PDF blob for a record. On web the blob is in the record; on Android read from disk. */
 export async function loadReceiptBlob(record: ReceiptRecord): Promise<Blob> {
   if (record.pdfBlob) return record.pdfBlob;
   if (isNative()) {
@@ -106,80 +113,134 @@ export async function getPruefenCount(): Promise<number> {
   return all.filter(r => r.folder.startsWith("Prüfen")).length;
 }
 
-// ── Android / Capacitor ──────────────────────────────────────────────────────
+/**
+ * Move (rename) a receipt file after background AI improvement.
+ * Writes to new path, then deletes the old file.
+ * On web: no-op (IndexedDB records don't need moving).
+ */
+export async function moveReceiptFile(
+  fromFolder:   string,
+  fromFileName: string,
+  toFolder:     string,
+  toFileName:   string,
+  pdfBlob:      Blob,
+): Promise<void> {
+  if (!isNative()) return;
+  if (fromFolder === toFolder && fromFileName === toFileName) return;
 
-const PREF_KEY = "receipts";
-
-interface AndroidMeta {
-  id:          string;
-  fileName:    string;
-  folder:      string;
-  createdAt:   string;
-  receiptDate: string | null;
-  amount:      string | null;
-  paymentType: "Bar" | "Karte";
-  ocrFailed:   boolean;
-}
-
-async function getAndroidMeta(): Promise<AndroidMeta[]> {
-  const { Preferences } = await import("@capacitor/preferences");
-  const { value } = await Preferences.get({ key: PREF_KEY });
-  if (!value) return [];
-  try { return JSON.parse(value) as AndroidMeta[]; } catch { return []; }
-}
-
-async function setAndroidMeta(list: AndroidMeta[]): Promise<void> {
-  const { Preferences } = await import("@capacitor/preferences");
-  await Preferences.set({ key: PREF_KEY, value: JSON.stringify(list) });
-}
-
-async function saveReceiptNative(record: Omit<ReceiptRecord, "id"> & { pdfBlob: Blob }): Promise<string> {
   const { Filesystem, Directory } = await import("@capacitor/filesystem");
-
-  const id       = `${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
-  const pdfB64   = await blobToBase64(record.pdfBlob);
-  const filePath = `Quittungsbox/${record.folder}/${record.fileName}`;
+  const b64 = await blobToBase64(pdfBlob);
 
   await Filesystem.writeFile({
-    path:      filePath,
-    data:      pdfB64,
+    path:      `Quittungsbox/${toFolder}/${toFileName}`,
+    data:      b64,
     directory: Directory.Documents,
     recursive: true,
   });
 
-  const meta   = await getAndroidMeta();
-  const newMeta: AndroidMeta = {
-    id, fileName: record.fileName, folder: record.folder,
-    createdAt: record.createdAt, receiptDate: record.receiptDate,
-    amount: record.amount, paymentType: record.paymentType,
-    ocrFailed: record.ocrFailed,
-  };
-  await setAndroidMeta([...meta, newMeta]);
-  return id;
+  try {
+    await Filesystem.deleteFile({
+      path:      `Quittungsbox/${fromFolder}/${fromFileName}`,
+      directory: Directory.Documents,
+    });
+  } catch { /* old file may be gone already */ }
 }
 
-async function getAllReceiptsNative(): Promise<ReceiptRecord[]> {
-  const metas = await getAndroidMeta();
-  return metas.map(m => ({ ...m, pdfBlob: undefined }));
+// ── Android / Filesystem scan ────────────────────────────────────────────────
+//
+// Walk Documents/Quittungsbox/ up to 5 levels deep.
+// Every .pdf file becomes a ReceiptRecord with metadata parsed from its path.
+// This means the filesystem IS the archive — there is exactly one copy of each PDF.
+
+async function saveReceiptNative(
+  record: Omit<ReceiptRecord, "id"> & { pdfBlob: Blob }
+): Promise<string> {
+  const { Filesystem, Directory } = await import("@capacitor/filesystem");
+  const pdfB64 = await blobToBase64(record.pdfBlob);
+  await Filesystem.writeFile({
+    path:      `Quittungsbox/${record.folder}/${record.fileName}`,
+    data:      pdfB64,
+    directory: Directory.Documents,
+    recursive: true,
+  });
+  // ID = relative path so it can be used directly for deletion / loading
+  return `${record.folder}/${record.fileName}`;
+}
+
+async function scanFilesystem(): Promise<ReceiptRecord[]> {
+  const { Filesystem, Directory } = await import("@capacitor/filesystem");
+  const results: ReceiptRecord[] = [];
+
+  async function walkDir(absPath: string, relFolder: string, depth: number): Promise<void> {
+    if (depth > 5) return;
+    try {
+      const { files } = await Filesystem.readdir({ path: absPath, directory: Directory.Documents });
+      for (const entry of files) {
+        const entryAbs = `${absPath}/${entry.name}`;
+        if (entry.type === "file" && entry.name.toLowerCase().endsWith(".pdf")) {
+          results.push(parseReceiptRecord(relFolder, entry.name));
+        } else if (entry.type === "directory") {
+          const childRel = relFolder ? `${relFolder}/${entry.name}` : entry.name;
+          await walkDir(entryAbs, childRel, depth + 1);
+        }
+      }
+    } catch { /* skip inaccessible dirs */ }
+  }
+
+  await walkDir("Quittungsbox", "", 0);
+  return results;
+}
+
+/** Reconstruct a ReceiptRecord from folder path + filename alone. */
+function parseReceiptRecord(folder: string, fileName: string): ReceiptRecord {
+  const base  = fileName.replace(/\.pdf$/i, "");
+  const parts = base.split("_");
+
+  // Last segment is always the payment type
+  const lastPart    = parts[parts.length - 1] ?? "";
+  const paymentType: "Bar" | "Karte" = lastPart === "Karte" ? "Karte" : "Bar";
+
+  // First segment is the date (YYYY-MM-DD) or "unbekannt-{timestamp}"
+  let receiptDate: string | null = null;
+  if (parts[0] && /^\d{4}-\d{2}-\d{2}$/.test(parts[0])) {
+    receiptDate = parts[0];
+  }
+
+  // Middle segment (if present and numeric) is the amount
+  let amount: string | null = null;
+  if (parts.length >= 3) {
+    const mid = parts[1];
+    if (/^\d+[.,]\d{2}$/.test(mid)) {
+      amount = mid.replace(",", ".");
+    }
+  }
+
+  return {
+    id:          `${folder}/${fileName}`,  // stable, path-derived
+    fileName,
+    folder,
+    createdAt:   receiptDate
+      ? `${receiptDate}T12:00:00.000Z`
+      : new Date().toISOString(),
+    receiptDate,
+    amount,
+    paymentType,
+    ocrFailed:   folder.includes("OCR Fehler"),
+  };
 }
 
 async function deleteReceiptNative(id: string): Promise<void> {
+  // id is "folder/fileName" in the scan-based system
   const { Filesystem, Directory } = await import("@capacitor/filesystem");
-
-  const meta    = await getAndroidMeta();
-  const target  = meta.find(m => m.id === id);
-  if (target) {
-    try {
-      await Filesystem.deleteFile({
-        path:      `Quittungsbox/${target.folder}/${target.fileName}`,
-        directory: Directory.Documents,
-      });
-    } catch { /* file may already be gone */ }
-  }
-  await setAndroidMeta(meta.filter(m => m.id !== id));
+  try {
+    await Filesystem.deleteFile({
+      path:      `Quittungsbox/${id}`,
+      directory: Directory.Documents,
+    });
+  } catch { /* file may already be gone */ }
 }
 
-// ── Web / IndexedDB ──────────────────────────────────────────────────────────
+// ── Web / IndexedDB ───────────────────────────────────────────────────────────
 
 const DB_NAME    = "quittungsbox";
 const DB_VERSION = 1;
@@ -201,7 +262,9 @@ function openDb(): Promise<IDBDatabase> {
   });
 }
 
-async function saveReceiptWeb(record: Omit<ReceiptRecord, "id"> & { pdfBlob: Blob }): Promise<string> {
+async function saveReceiptWeb(
+  record: Omit<ReceiptRecord, "id"> & { pdfBlob: Blob }
+): Promise<string> {
   const db = await openDb();
   return new Promise((resolve, reject) => {
     const { id: _id, ...data } = record as ReceiptRecord;
@@ -227,21 +290,21 @@ async function getAllReceiptsWeb(): Promise<ReceiptRecord[]> {
 async function deleteReceiptWeb(id: string): Promise<void> {
   const db = await openDb();
   return new Promise((resolve, reject) => {
-    const req = db.transaction(STORE, "readwrite").objectStore(STORE).delete(Number(id));
+    const req = db
+      .transaction(STORE, "readwrite")
+      .objectStore(STORE)
+      .delete(Number(id));
     req.onsuccess = () => resolve();
     req.onerror   = () => reject(req.error);
   });
 }
 
-// ── helpers ──────────────────────────────────────────────────────────────────
+// ── helpers ───────────────────────────────────────────────────────────────────
 
-function blobToBase64(blob: Blob): Promise<string> {
+export function blobToBase64(blob: Blob): Promise<string> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
-    reader.onload  = () => {
-      const result = reader.result as string;
-      resolve(result.split(",")[1]);
-    };
+    reader.onload  = () => resolve((reader.result as string).split(",")[1]);
     reader.onerror = () => reject(reader.error);
     reader.readAsDataURL(blob);
   });
