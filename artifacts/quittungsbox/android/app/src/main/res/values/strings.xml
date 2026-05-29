@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">Quittungsbox</string>
+    <string name="title_activity_main">Quittungsbox</string>
+    <string name="package_name">ch.quittungsbox.app</string>
+    <string name="custom_url_scheme">ch.quittungsbox.app</string>
+</resources>

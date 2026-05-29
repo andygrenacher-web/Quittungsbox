@@ -495,3 +495,18 @@ export function canvasToBlob(canvas: HTMLCanvasElement, quality = 0.88): Promise
 export function canvasToDataUrl(canvas: HTMLCanvasElement): string {
   return canvas.toDataURL("image/jpeg", 0.82);
 }
+
+/**
+ * Prepare a pre-corrected image (e.g. from ML Kit Document Scanner) for
+ * display and OCR without running the document detection pipeline.
+ * Returns the same ScanResult shape so Home.tsx can use it identically.
+ */
+export async function prepareScannedImage(imageBlob: Blob): Promise<ScanResult> {
+  const img = await loadImg(imageBlob);
+  const rawCanvas = document.createElement("canvas");
+  rawCanvas.width  = img.naturalWidth;
+  rawCanvas.height = img.naturalHeight;
+  rawCanvas.getContext("2d")!.drawImage(img, 0, 0);
+  const canvas = applyGrau(rawCanvas);
+  return { rawCanvas, canvas, corrected: true };
+}

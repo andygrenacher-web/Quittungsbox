@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { useLocation } from "wouter";
-import { getAllReceipts, deleteReceipt, type ReceiptRecord } from "@/lib/storage";
+import { getAllReceipts, deleteReceipt, loadReceiptBlob, type ReceiptRecord } from "@/lib/storage";
 
 // ── folder tree helpers ────────────────────────────────────
 
@@ -12,11 +12,10 @@ interface FolderNode {
 }
 
 function buildTree(records: ReceiptRecord[]): FolderNode[] {
-  // root nodes keyed by first path segment ("Archiv" | "Prüfen")
   const roots: Record<string, FolderNode> = {};
 
   for (const r of records) {
-    const parts = r.folder.split("/"); // ["Archiv","2026","05 Mai"] or ["Prüfen","Kein Datum"]
+    const parts = r.folder.split("/");
     let level = roots;
     let parent: FolderNode | null = null;
 
@@ -36,7 +35,6 @@ function buildTree(records: ReceiptRecord[]): FolderNode[] {
     }
   }
 
-  // Sort: Archiv before Prüfen; within Archiv: descending year/month
   return Object.values(roots).sort((a, b) => {
     if (a.label === "Prüfen") return 1;
     if (b.label === "Prüfen") return -1;
@@ -50,24 +48,30 @@ function countReceipts(node: FolderNode): number {
 
 // ── download / share ───────────────────────────────────────
 
-function downloadBlob(blob: Blob, name: string) {
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url; a.download = name; a.click();
-  setTimeout(() => URL.revokeObjectURL(url), 5000);
-}
-
 async function shareOrDownload(r: ReceiptRecord) {
-  const file = new File([r.pdfBlob], r.fileName, { type: "application/pdf" });
+  // loadReceiptBlob handles both web (already in record) and Android (reads Filesystem)
+  const blob = await loadReceiptBlob(r);
+  const file = new File([blob], r.fileName, { type: "application/pdf" });
   if (navigator.canShare?.({ files: [file] })) {
     try { await navigator.share({ files: [file], title: r.fileName }); return; } catch { /* fall through */ }
   }
-  downloadBlob(r.pdfBlob, r.fileName);
+  // Fallback: trigger browser download
+  const url = URL.createObjectURL(blob);
+  const a   = document.createElement("a");
+  a.href = url; a.download = r.fileName; a.click();
+  setTimeout(() => URL.revokeObjectURL(url), 5000);
 }
 
 // ── sub-components ─────────────────────────────────────────
 
 function ReceiptRow({ r, onDelete }: { r: ReceiptRecord; onDelete: () => void }) {
+  const [sharing, setSharing] = useState(false);
+
+  async function handleShare() {
+    setSharing(true);
+    try { await shareOrDownload(r); } finally { setSharing(false); }
+  }
+
   return (
     <div className="flex items-center gap-2 py-2.5 px-3 rounded-xl bg-muted/60 border border-border">
       <div className="flex-1 min-w-0">
@@ -79,15 +83,22 @@ function ReceiptRow({ r, onDelete }: { r: ReceiptRecord; onDelete: () => void })
         )}
       </div>
       <button
-        onClick={() => shareOrDownload(r)}
-        className="p-2 rounded-lg active:bg-muted text-muted-foreground shrink-0"
+        onClick={handleShare}
+        disabled={sharing}
+        className="p-2 rounded-lg active:bg-muted text-muted-foreground shrink-0 disabled:opacity-40"
         title="Herunterladen / Teilen"
       >
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-          <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
-          <polyline points="7,10 12,15 17,10"/>
-          <line x1="12" y1="15" x2="12" y2="3"/>
-        </svg>
+        {sharing ? (
+          <svg className="animate-spin w-4 h-4" viewBox="0 0 24 24" fill="none">
+            <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="3" strokeDasharray="31.4" strokeDashoffset="10"/>
+          </svg>
+        ) : (
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+            <polyline points="7,10 12,15 17,10"/>
+            <line x1="12" y1="15" x2="12" y2="3"/>
+          </svg>
+        )}
       </button>
       <button
         onClick={onDelete}
@@ -108,11 +119,11 @@ function ReceiptRow({ r, onDelete }: { r: ReceiptRecord; onDelete: () => void })
 function FolderSection({
   node, depth = 0, onDelete,
 }: {
-  node: FolderNode; depth?: number; onDelete: (id: number) => void;
+  node: FolderNode; depth?: number; onDelete: (id: string) => void;
 }) {
   const total    = countReceipts(node);
   const isPrüfen = node.fullPath.startsWith("Prüfen");
-  const [open, setOpen] = useState(depth < 2); // auto-open top two levels
+  const [open, setOpen] = useState(depth < 2);
 
   return (
     <div className={depth === 0 ? "mb-4" : "mt-1"}>
@@ -120,10 +131,8 @@ function FolderSection({
         onClick={() => setOpen(o => !o)}
         className="w-full flex items-center gap-2 px-1 py-1.5 rounded-lg active:bg-muted text-left"
       >
-        {/* indent */}
         {depth > 0 && <span style={{ width: depth * 14 }} className="shrink-0" />}
 
-        {/* icon */}
         <span className="text-base shrink-0">
           {depth === 0 && isPrüfen ? "⚠️" : depth === 0 ? "🗄️" : depth === 1 ? "📅" : "📁"}
         </span>
@@ -151,11 +160,9 @@ function FolderSection({
 
       {open && (
         <div className={depth === 0 ? "mt-1" : ""}>
-          {/* child folders */}
           {node.children.map(child => (
             <FolderSection key={child.fullPath} node={child} depth={depth + 1} onDelete={onDelete} />
           ))}
-          {/* receipts at this level */}
           {node.receipts.length > 0 && (
             <div className="flex flex-col gap-1.5 mt-1" style={{ paddingLeft: (depth + 1) * 14 + 22 }}>
               {node.receipts
@@ -165,7 +172,7 @@ function FolderSection({
                   <ReceiptRow
                     key={r.id}
                     r={r}
-                    onDelete={() => r.id != null && onDelete(r.id)}
+                    onDelete={() => onDelete(r.id)}
                   />
                 ))}
             </div>
@@ -191,7 +198,7 @@ export default function Archive() {
 
   useEffect(() => { load(); }, []);
 
-  async function handleDelete(id: number) {
+  async function handleDelete(id: string) {
     await deleteReceipt(id);
     setRecords(prev => prev.filter(r => r.id !== id));
   }

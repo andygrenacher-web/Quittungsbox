@@ -1,9 +1,11 @@
 import { useEffect, useRef, useState } from "react";
 import { useLocation } from "wouter";
-import { scanImage, canvasToBlob, canvasToDataUrl, applyOriginal, applyGrau, applyScan } from "@/lib/scanner";
+import { scanImage, prepareScannedImage, canvasToBlob, canvasToDataUrl, applyOriginal, applyGrau, applyScan } from "@/lib/scanner";
 import { runOcr, buildFileName } from "@/lib/ocr";
 import { generatePdfFromCanvas } from "@/lib/pdf";
 import { saveReceipt, getPruefenCount, getFolder } from "@/lib/storage";
+import { capturePhoto } from "@/lib/capture";
+import { isNative } from "@/lib/platform";
 
 type PaymentType  = "Bar" | "Karte";
 type AppMode      = "idle" | "scanning" | "preview" | "processing" | "done" | "error";
@@ -34,9 +36,6 @@ export default function Home() {
   const [errorMsg,     setErrorMsg]     = useState("");
   const [pruefenCount, setPruefenCount] = useState(0);
 
-  // rawCanvas = warped colour (source for mode switching)
-  // ocrCanvas = always "grau" (best for Tesseract, pre-computed once)
-  // displayCanvas = currently selected mode (used for PDF)
   const rawCanvasRef     = useRef<HTMLCanvasElement | null>(null);
   const ocrCanvasRef     = useRef<HTMLCanvasElement | null>(null);
   const displayCanvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -64,14 +63,17 @@ export default function Home() {
 
   // ── capture ────────────────────────────────────────────────
 
-  async function handleCapture(pt: PaymentType, file: File) {
+  async function handleCapture(pt: PaymentType, imageBlob: Blob, alreadyCorrected = false) {
     setPaymentType(pt);
     setAppMode("scanning");
-    setScanStatus("Beleg wird erkannt …");
+    setScanStatus(alreadyCorrected ? "Bild wird verarbeitet …" : "Beleg wird erkannt …");
     try {
-      const { rawCanvas, canvas: grauCanvas, corrected: cor } = await scanImage(
-        new Blob([file], { type: file.type })
-      );
+      // When ML Kit Document Scanner was used, skip our canvas-based detection
+      // (the image is already cropped + perspective-corrected).
+      const { rawCanvas, canvas: grauCanvas, corrected: cor } = alreadyCorrected
+        ? await prepareScannedImage(imageBlob)
+        : await scanImage(imageBlob);
+
       rawCanvasRef.current     = rawCanvas;
       ocrCanvasRef.current     = grauCanvas;
       displayCanvasRef.current = grauCanvas;
@@ -85,19 +87,48 @@ export default function Home() {
     }
   }
 
+  // ── native camera (Android / Capacitor) ───────────────────
+
+  async function captureNative(pt: PaymentType) {
+    try {
+      const result = await capturePhoto();
+      if (!result) return; // user cancelled
+      handleCapture(pt, result.blob, result.alreadyCorrected);
+    } catch {
+      // user cancelled — do nothing, stay on idle screen
+    }
+  }
+
+  // ── web file input ─────────────────────────────────────────
+
+  function onFileChange(pt: PaymentType) {
+    return (e: React.ChangeEvent<HTMLInputElement>) => {
+      const file = e.target.files?.[0]; if (!file) return;
+      e.target.value = "";
+      handleCapture(pt, new Blob([file], { type: file.type }));
+    };
+  }
+
+  function triggerCapture(pt: PaymentType) {
+    if (isNative()) {
+      captureNative(pt);
+    } else {
+      if (pt === "Bar")   barRef.current?.click();
+      else                karteRef.current?.click();
+    }
+  }
+
   // ── save (OCR on grau canvas, PDF on display-mode canvas) ─
 
   async function handleSave() {
     if (!displayCanvasRef.current || !ocrCanvasRef.current || !paymentType) return;
     setAppMode("processing");
-    setScanStatus("OCR läuft …");
+    setScanStatus(isNative() ? "ML Kit OCR läuft …" : "OCR läuft …");
     try {
-      // OCR always uses the grayscale version (best accuracy)
       const ocrBlob   = await canvasToBlob(ocrCanvasRef.current);
       const ocrResult = await runOcr(ocrBlob);
 
       setScanStatus("PDF wird erstellt …");
-      // PDF uses whichever display mode the user selected
       const pdfBlob  = await generatePdfFromCanvas(displayCanvasRef.current, ocrResult.rawText);
       const fileName = buildFileName(paymentType, ocrResult.vendor, ocrResult.amount, ocrResult.receiptDate);
       const folder   = getFolder(ocrResult.receiptDate, ocrResult.ocrFailed);
@@ -143,13 +174,6 @@ export default function Home() {
     setDisplayMode("grau");
   }
 
-  function onFileChange(pt: PaymentType) {
-    return (e: React.ChangeEvent<HTMLInputElement>) => {
-      const file = e.target.files?.[0]; if (!file) return;
-      e.target.value = ""; handleCapture(pt, file);
-    };
-  }
-
   // ── render ─────────────────────────────────────────────────
 
   return (
@@ -168,7 +192,9 @@ export default function Home() {
         </div>
         <div className="flex-1">
           <h1 className="text-xl font-bold text-foreground leading-none">Quittungsbox</h1>
-          <p className="text-xs text-muted-foreground mt-0.5">Beleg fotografieren, fertig.</p>
+          <p className="text-xs text-muted-foreground mt-0.5">
+            {isNative() ? "Android · ML Kit OCR · Lokal" : "Beleg fotografieren, fertig."}
+          </p>
         </div>
         <button onClick={() => setLocation("/archiv")}
           className="relative h-9 px-3 rounded-xl bg-muted flex items-center gap-1.5 active:bg-accent text-sm font-medium text-foreground">
@@ -193,7 +219,7 @@ export default function Home() {
           <>
             <p className="text-center text-sm text-muted-foreground mb-2">Womit wurde bezahlt?</p>
 
-            <button onClick={() => barRef.current?.click()}
+            <button onClick={() => triggerCapture("Bar")}
               className="w-full flex-1 max-h-[38vh] min-h-[160px] rounded-2xl flex flex-col items-center justify-center gap-3 active:scale-[0.97] transition-transform duration-100 shadow-md"
               style={{ background: "hsl(142 55% 36%)" }}>
               <div className="w-16 h-16 rounded-2xl bg-white/20 flex items-center justify-center">
@@ -207,7 +233,7 @@ export default function Home() {
               <span className="text-white/70 text-sm">Bargeld</span>
             </button>
 
-            <button onClick={() => karteRef.current?.click()}
+            <button onClick={() => triggerCapture("Karte")}
               className="w-full flex-1 max-h-[38vh] min-h-[160px] rounded-2xl flex flex-col items-center justify-center gap-3 active:scale-[0.97] transition-transform duration-100 shadow-md"
               style={{ background: "hsl(221 80% 52%)" }}>
               <div className="w-16 h-16 rounded-2xl bg-white/20 flex items-center justify-center">
@@ -220,8 +246,13 @@ export default function Home() {
               <span className="text-white/70 text-sm">EC / Kredit</span>
             </button>
 
-            <input ref={barRef}   type="file" accept="image/*" capture="environment" className="hidden" onChange={onFileChange("Bar")} />
-            <input ref={karteRef} type="file" accept="image/*" capture="environment" className="hidden" onChange={onFileChange("Karte")} />
+            {/* Web-only hidden file inputs */}
+            {!isNative() && (
+              <>
+                <input ref={barRef}   type="file" accept="image/*" capture="environment" className="hidden" onChange={onFileChange("Bar")} />
+                <input ref={karteRef} type="file" accept="image/*" capture="environment" className="hidden" onChange={onFileChange("Karte")} />
+              </>
+            )}
           </>
         )}
 
@@ -250,7 +281,6 @@ export default function Home() {
         {/* ── PREVIEW ── */}
         {appMode === "preview" && previewUrl && (
           <div className="flex flex-col gap-3">
-            {/* Mode selector */}
             <div className="flex items-center gap-1 p-1 rounded-xl bg-muted">
               {MODES.map(m => (
                 <button key={m.id} onClick={() => switchMode(m.id)}
@@ -263,17 +293,21 @@ export default function Home() {
               ))}
             </div>
 
-            {/* Preview image */}
             <div className="rounded-2xl overflow-hidden border border-border shadow-sm bg-card max-h-[52vh] flex items-center justify-center">
               <img src={previewUrl} alt="Scan-Vorschau" className="max-w-full max-h-[52vh] object-contain block" />
             </div>
 
-            {/* Badges */}
             <div className="flex items-center gap-2 flex-wrap">
               {corrected && (
                 <span className="text-xs font-medium px-2.5 py-1 rounded-full"
                   style={{ background: "hsl(142 55% 36% / 0.12)", color: "hsl(142 55% 30%)" }}>
                   ✦ Perspektive korrigiert
+                </span>
+              )}
+              {isNative() && (
+                <span className="text-xs font-medium px-2.5 py-1 rounded-full"
+                  style={{ background: "hsl(221 80% 52% / 0.10)", color: "hsl(221 80% 40%)" }}>
+                  ML Kit OCR
                 </span>
               )}
               <span className="text-xs text-muted-foreground px-2.5 py-1 rounded-full bg-muted">
@@ -321,6 +355,11 @@ export default function Home() {
                 <span className="text-xs">{done.folder.startsWith("Prüfen") ? "⚠️" : "📁"}</span>
                 <span className="text-xs font-medium">{done.folder}</span>
               </div>
+              {isNative() && (
+                <p className="text-xs text-muted-foreground mt-2">
+                  Gespeichert unter Dokumente/Quittungsbox/
+                </p>
+              )}
             </div>
             <div className="w-full flex flex-col gap-3 mt-1">
               <button onClick={sharePdf}
@@ -373,7 +412,9 @@ export default function Home() {
 
       {appMode === "idle" && (
         <footer className="px-5 pb-6 text-center">
-          <p className="text-xs text-muted-foreground">Alles lokal · Kein Server · Kein Konto</p>
+          <p className="text-xs text-muted-foreground">
+            {isNative() ? "Alles lokal · Android APK · ML Kit OCR" : "Alles lokal · Kein Server · Kein Konto"}
+          </p>
         </footer>
       )}
     </div>

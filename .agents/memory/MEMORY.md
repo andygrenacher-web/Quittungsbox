@@ -1,0 +1,1 @@
+- [Quittungsbox Capacitor ML Kit packages](quittungsbox-capacitor.md) — which ML Kit packages exist on npm and the alreadyCorrected capture pattern
