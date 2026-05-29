@@ -200,8 +200,8 @@ export default function Home() {
               <span className="text-white/70 text-sm">EC / Kredit</span>
             </button>
 
-            <input ref={barRef}   type="file" accept="image/*" className="hidden" onChange={onFileChange("Bar")} />
-            <input ref={karteRef} type="file" accept="image/*" className="hidden" onChange={onFileChange("Karte")} />
+            <input ref={barRef}   type="file" accept="image/*" capture="environment" className="hidden" onChange={onFileChange("Bar")} />
+            <input ref={karteRef} type="file" accept="image/*" capture="environment" className="hidden" onChange={onFileChange("Karte")} />
           </>
         )}
 
