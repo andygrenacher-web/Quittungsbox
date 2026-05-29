@@ -49,26 +49,39 @@ function isValidDate(d: Date): boolean {
 
 // ── amount extraction ────────────────────────────────────────────────────────
 
-// Highest priority: unambiguous final payment lines
-const STRONG_TOTAL = /\b(Rechnungstotal|Gesamttotal|Totalbetrag|Gesamtbetrag|Endbetrag|Rechnungsbetrag|ZU\s+ZAHLEN|ZU\s+BEZAHLEN|zu\s+bezahlen|zu\s+zahlen|Zu\s+zahlen|Zu\s+bezahlen|BEZAHLT|Bezahlt|Kassiert|dankend\s+erhalten|Betrag\s+erhalten|inkl\.?\s*MWST|inkl\.?\s*MwSt)\b/i;
+// Highest priority: unambiguous invoice-total lines
+const STRONG_TOTAL = /\b(Rechnungstotal|Gesamttotal|Totalbetrag|Gesamtbetrag|Endbetrag|Rechnungsbetrag|Brutto|Bruttobetrag|ZU\s+ZAHLEN|ZU\s+BEZAHLEN|zu\s+bezahlen|zu\s+zahlen|Zu\s+zahlen|Zu\s+bezahlen|dankend\s+erhalten|inkl\.?\s*MWST|inkl\.?\s*MwSt)\b/i;
 
 // Standard total keywords (lower priority than STRONG_TOTAL)
-const TOTAL_KW = /\b(Total|Summe|Gesamt|Zahlung|Zahlen|Grand\s+total)\b|(?<!\w)CHF(?!\w)/i;
+const TOTAL_KW = /\b(Total|Summe|Betrag|Gesamt|Grand\s+total)\b|(?<!\w)CHF(?!\w)/i;
 
 // Lines to EXCLUDE from amount detection.
-// Excludes: net amounts, quantities, weights, volumes, tax lines, unit prices,
-// tank/pump specific terms, reference numbers, discounts.
+// ── Cash-flow lines (NOT the invoice amount) ──
+//   Rückgeld / Wechselgeld / Retourgeld = change given back
+//   Bargeld / Bargeld erhalten / Geldeinwurf = cash tendered by customer
+//   Bezahlt / Kassiert = payment tender (can exceed invoice when paying with note)
+//   Ausbezahlt / Rückgabe / Retoure = refund / return
+// ── Net / pre-tax amounts ──
+//   Netto / Warenwert / Grundbetrag = subtotals before tax
+// ── Tax component lines ──
+//   MWST / USt / Steuer = VAT amount (not the gross total)
+// ── Quantities & units ── (prevents picking up weights, litres, etc.)
+// ── Unit prices, reference numbers, discounts ──
 const EXCL_KW = new RegExp(
   String.raw`\b(` +
-    // Net / pre-tax amounts — we want the gross total, not netto
-    String.raw`Netto|Nettobetrag|Nettosumme|Netto-Betrag|Warenwert|Grundbetrag|` +
-    // Tax amount lines (the VAT component, not the total)
+    // Cash-flow / change / tender lines
+    String.raw`Rückgeld|Wechselgeld|Retourgeld|Ausbezahlt|Rückgabe|Retoure|` +
+    String.raw`Geldeinwurf|Bargeld|` +
+    String.raw`Bezahlt|Kassiert|` +
+    // Net / pre-tax amounts
+    String.raw`Netto|Nettobetrag|Nettosumme|Warenwert|Grundbetrag|` +
+    // Tax lines
     String.raw`MWST|MwSt|USt|Ust\.|Steuer|` +
     // Quantities & units
     String.raw`Menge|Anzahl|Liter|Ltr\.?|kg|Stk\.?|Stück|` +
-    // Price-per-unit / unit prices
+    // Unit prices
     String.raw`Einzel|Einzelpreis|Grundpreis|Literpreis|Einheitspreis|` +
-    // Tank / fuel receipts
+    // Tank / fuel
     String.raw`Tankautomat|Zapfpunkt|Zapfsäule|` +
     // Reference numbers
     String.raw`Beleg[-\s]*Nr\.?|Art[-\s]*Nr\.?|Bon[-\s]*Nr\.?|` +
@@ -79,7 +92,7 @@ const EXCL_KW = new RegExp(
   String.raw`|\bpro\s+(kg|l|Ltr|Stk)\b` +
   String.raw`|\/\s*(kg|l|Ltr)\b` +
   String.raw`|\bPreis\s*\/` +
-  // Multiplication: "3 × 4.50" or "2 x 5.00"
+  // Multiplication: "3 × 4.50"
   String.raw`|\d+\s*[×xX\*]\s*\d`,
   "i"
 );
