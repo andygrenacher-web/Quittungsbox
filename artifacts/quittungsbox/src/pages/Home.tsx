@@ -25,34 +25,7 @@ const MODES: { id: DisplayMode; label: string; hint: string }[] = [
   { id: "scan",     label: "Scan",        hint: "Höherer Kontrast" },
 ];
 
-// ── Background AI enrichment ─────────────────────────────────────────────────
-// Called after the PDF is already saved. Runs silently; never blocks the UI.
-// If AI extracts a better date/amount, it renames the file in-place.
-async function runBackgroundAi(
-  savedFolder:   string,
-  savedFileName: string,
-  imageDataUrl:  string,
-  rawText:       string,
-  paymentType:   PaymentType,
-  pdfBlob:       Blob,
-): Promise<void> {
-  try {
-    if (!navigator.onLine || !imageDataUrl) return;
-    const [apiKey, aiOn] = await Promise.all([getOpenAiKey(), isAiEnabled()]);
-    if (!apiKey || !aiOn) return;
-
-    const ai = await analyzeReceiptWithAi(imageDataUrl, rawText, apiKey);
-    if (!ai || ai.confidence !== "high") return;
-
-    const newFileName = buildFileName(paymentType, null, ai.amount, ai.date);
-    const newFolder   = getFolder(ai.date, false);
-
-    // Only move if there is a genuine improvement
-    if (newFileName === savedFileName && newFolder === savedFolder) return;
-
-    await moveReceiptFile(savedFolder, savedFileName, newFolder, newFileName, pdfBlob);
-  } catch { /* silent — background task must never crash the app */ }
-}
+type AiStatus = "off" | "analyzing" | "done" | "uncertain";
 
 // ── Component ─────────────────────────────────────────────────────────────────
 
@@ -69,12 +42,14 @@ export default function Home() {
   const [errorMsg,     setErrorMsg]     = useState("");
   const [pruefenCount, setPruefenCount] = useState(0);
   const [aiConfigured, setAiConfigured] = useState(false);
+  const [aiStatus,     setAiStatus]     = useState<AiStatus>("off");
 
   const rawCanvasRef     = useRef<HTMLCanvasElement | null>(null);
   const ocrCanvasRef     = useRef<HTMLCanvasElement | null>(null);
   const displayCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const barRef           = useRef<HTMLInputElement>(null);
   const karteRef         = useRef<HTMLInputElement>(null);
+  const saveTokenRef     = useRef(0);   // guards against stale AI completions after reset
 
   async function loadPruefenCount() {
     try { setPruefenCount(await getPruefenCount()); } catch { /* ignore */ }
@@ -153,48 +128,122 @@ export default function Home() {
   // ── save — OCR → PDF → persist → done → AI in background ─
 
   async function handleSave() {
-    if (!displayCanvasRef.current || !ocrCanvasRef.current || !paymentType) return;
+    if (!displayCanvasRef.current || !paymentType) return;
+    const token = ++saveTokenRef.current;
     setAppMode("processing");
-    setScanStatus("OCR läuft …");
 
     try {
-      // 1. OCR (local, always)
-      const ocrBlob   = await canvasToBlob(ocrCanvasRef.current);
-      const ocrResult = await runOcr(ocrBlob);
+      // Decide upfront whether AI is the analyzer for this receipt.
+      const [apiKey, aiOn] = await Promise.all([getOpenAiKey(), isAiEnabled()]);
+      const useAi = !!apiKey && aiOn && navigator.onLine;
 
-      // 2. Build filename + folder from OCR result (may be refined by AI later)
-      setScanStatus("PDF wird erstellt …");
-      const pdfBlob  = await generatePdfFromCanvas(displayCanvasRef.current, ocrResult.rawText);
-      const fileName = buildFileName(paymentType, ocrResult.vendor, ocrResult.amount, ocrResult.receiptDate);
-      const folder   = getFolder(ocrResult.receiptDate, ocrResult.ocrFailed);
-
-      // 3. Save immediately — user sees done screen right away
-      await saveReceipt({
-        fileName, folder, pdfBlob,
-        createdAt:   new Date().toISOString(),
-        receiptDate: ocrResult.receiptDate,
-        amount:      ocrResult.amount,
-        paymentType,
-        ocrFailed:   ocrResult.ocrFailed,
-      });
-
-      await loadPruefenCount();
-      setDone({ fileName, folder, pdfBlob });
-      setAppMode("done");
-
-      // 4. AI enrichment runs in background — fire and forget.
-      //    The ORIGINAL receipt image is sent to the AI (vision), so it reads
-      //    the receipt directly and is not limited by OCR errors. OCR text is a hint.
-      //    If it improves date/amount, it renames the file silently.
-      const aiImage = canvasToCompressedDataUrl(
-        rawCanvasRef.current ?? displayCanvasRef.current,
-      );
-      void runBackgroundAi(folder, fileName, aiImage, ocrResult.rawText, paymentType, pdfBlob);
-
+      if (useAi) {
+        await saveWithAi(token, apiKey!);
+      } else {
+        await saveWithOcr(token);
+      }
     } catch {
       setErrorMsg("PDF konnte nicht erstellt werden.");
       setAppMode("error");
     }
+  }
+
+  // ── AI path — image is the source of truth ───────────────────────
+  // 1. Save the PDF locally FIRST (into Prüfen) so nothing is ever lost.
+  // 2. Show the done screen immediately — the app never blocks.
+  // 3. Send the image to the AI; it reads date + amount itself.
+  //    confident  → rename + move into the correct Archiv folder.
+  //    unsure     → leave it in Prüfen for manual review.
+  async function saveWithAi(token: number, apiKey: string) {
+    const pt = paymentType!;
+    setScanStatus("PDF wird erstellt …");
+    const pdfBlob = await generatePdfFromCanvas(displayCanvasRef.current!, "");
+
+    // Provisional local save — unique name so quick successive scans don't collide.
+    const provFileName = `unbekannt-${Date.now()}_${pt}.pdf`;
+    const provFolder   = "Prüfen/Kein Datum";
+    await saveReceipt({
+      fileName: provFileName, folder: provFolder, pdfBlob,
+      createdAt:   new Date().toISOString(),
+      receiptDate: null,
+      amount:      null,
+      paymentType: pt,
+      ocrFailed:   false,
+    });
+
+    await loadPruefenCount();
+    setDone({ fileName: provFileName, folder: provFolder, pdfBlob });
+    setAiStatus("analyzing");
+    setAppMode("done");
+
+    // ── Post-save phase ──────────────────────────────────────────────
+    // The receipt is already safely on disk. From here on nothing may throw
+    // to the global handler — a failure must never show the error screen or
+    // lose the file. Worst case the receipt simply stays in Prüfen.
+    try {
+      const aiImage = canvasToCompressedDataUrl(rawCanvasRef.current ?? displayCanvasRef.current!);
+      const ai = await analyzeReceiptWithAi(aiImage, apiKey);
+
+      // Ignore if the user already started a new receipt.
+      if (saveTokenRef.current !== token) return;
+
+      if (ai && ai.confidence === "high" && ai.date && ai.amount) {
+        // The user's tap (Bar/Karte) is authoritative for payment type —
+        // it is real intent the user entered, not a guess from the image.
+        const finalFolder   = getFolder(ai.date, false);
+        const finalFileName = buildFileName(pt, null, ai.amount, ai.date);
+        await moveReceiptFile(provFolder, provFileName, finalFolder, finalFileName, pdfBlob);
+        if (saveTokenRef.current !== token) return;
+        await loadPruefenCount();
+        setDone({ fileName: finalFileName, folder: finalFolder, pdfBlob });
+        setAiStatus("done");
+      } else {
+        // Unsure — keep in Prüfen, but use whatever AI did read for a better name/subfolder.
+        const date         = ai?.date ?? null;
+        const amount       = ai?.amount ?? null;
+        const reviewFolder = !date ? "Prüfen/Kein Datum" : "Prüfen/Kein Betrag";
+        const reviewName   = buildFileName(pt, null, amount, date);
+        await moveReceiptFile(provFolder, provFileName, reviewFolder, reviewName, pdfBlob);
+        if (saveTokenRef.current !== token) return;
+        await loadPruefenCount();
+        setDone({ fileName: reviewName, folder: reviewFolder, pdfBlob });
+        setAiStatus("uncertain");
+      }
+    } catch {
+      // AI or move failed — the receipt stays safely in Prüfen as provisionally saved.
+      if (saveTokenRef.current !== token) return;
+      setAiStatus("uncertain");
+    }
+  }
+
+  // ── OCR fallback — used only when AI is off, no key, or offline ───
+  async function saveWithOcr(token: number) {
+    if (!ocrCanvasRef.current) return;
+    const pt = paymentType!;
+    setAiStatus("off");
+    setScanStatus("Beleg wird gelesen …");
+
+    const ocrBlob   = await canvasToBlob(ocrCanvasRef.current);
+    const ocrResult = await runOcr(ocrBlob);
+
+    setScanStatus("PDF wird erstellt …");
+    const pdfBlob  = await generatePdfFromCanvas(displayCanvasRef.current!, ocrResult.rawText);
+    const fileName = buildFileName(pt, ocrResult.vendor, ocrResult.amount, ocrResult.receiptDate);
+    const folder   = getFolder(ocrResult.receiptDate, ocrResult.ocrFailed);
+
+    await saveReceipt({
+      fileName, folder, pdfBlob,
+      createdAt:   new Date().toISOString(),
+      receiptDate: ocrResult.receiptDate,
+      amount:      ocrResult.amount,
+      paymentType: pt,
+      ocrFailed:   ocrResult.ocrFailed,
+    });
+
+    if (saveTokenRef.current !== token) return;
+    await loadPruefenCount();
+    setDone({ fileName, folder, pdfBlob });
+    setAppMode("done");
   }
 
   // ── download / share ──────────────────────────────────────
@@ -216,9 +265,10 @@ export default function Home() {
   }
 
   function reset() {
+    saveTokenRef.current++;   // any in-flight AI completion is now ignored
     rawCanvasRef.current = null; ocrCanvasRef.current = null; displayCanvasRef.current = null;
     setAppMode("idle"); setDone(null); setPreviewUrl(""); setPaymentType(null); setErrorMsg("");
-    setDisplayMode("grau");
+    setDisplayMode("grau"); setAiStatus("off");
   }
 
   // ── render ────────────────────────────────────────────────
@@ -415,11 +465,27 @@ export default function Home() {
                 <span className="text-xs">{done.folder.startsWith("Prüfen") ? "⚠️" : "📁"}</span>
                 <span className="text-xs font-medium">{done.folder}</span>
               </div>
-              {aiConfigured && navigator.onLine && (
-                <p className="text-[11px] text-muted-foreground mt-2">
-                  KI verfeinert Dateiname im Hintergrund …
+
+              {aiStatus === "analyzing" && (
+                <p className="text-[11px] text-muted-foreground mt-2 flex items-center justify-center gap-1.5">
+                  <svg className="animate-spin w-3 h-3" viewBox="0 0 24 24" fill="none">
+                    <circle cx="12" cy="12" r="9" stroke="currentColor" strokeOpacity="0.25" strokeWidth="3"/>
+                    <path d="M12 3a9 9 0 0 1 9 9" stroke="currentColor" strokeWidth="3" strokeLinecap="round"/>
+                  </svg>
+                  KI liest den Beleg …
                 </p>
               )}
+              {aiStatus === "done" && (
+                <p className="text-[11px] mt-2" style={{ color: "hsl(142 55% 30%)" }}>
+                  ✓ Von KI erkannt und einsortiert
+                </p>
+              )}
+              {aiStatus === "uncertain" && (
+                <p className="text-[11px] mt-2" style={{ color: "hsl(30 80% 35%)" }}>
+                  KI war unsicher — bitte im Archiv unter „Prüfen“ kontrollieren.
+                </p>
+              )}
+
               {isNative() && (
                 <p className="text-xs text-muted-foreground mt-1">
                   Dokumente/Quittungsbox/{done.folder}/

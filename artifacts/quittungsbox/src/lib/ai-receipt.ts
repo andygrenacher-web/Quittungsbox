@@ -1,62 +1,65 @@
-// Optional AI-powered receipt analysis via OpenAI.
+// AI-powered receipt analysis via OpenAI (vision).
 //
-// Uses the OCR text already extracted locally — no image is sent to the server.
-// The app always saves locally first; AI is only used to improve filename/folder.
-// Falls back gracefully when offline, no key, or API error.
+// When AI is enabled and a key is present, the ORIGINAL receipt image is sent
+// to OpenAI. The model reads the receipt itself and returns only:
+//   - date (Belegdatum)
+//   - amount (Totalbetrag inkl. MWST — the real payable amount)
+//   - paymentType (Bar / Karte)
+// The app always saves locally first; AI only decides the final name/folder.
+// Falls back gracefully when offline, no key, or API error (returns null).
 
 export interface AiReceiptResult {
-  date:       string | null;   // YYYY-MM-DD
-  amount:     string | null;   // e.g. "82.10"
-  confidence: "high" | "low";  // high = date AND amount both clearly found
+  date:        string | null;          // YYYY-MM-DD
+  amount:      string | null;          // e.g. "82.10" — total incl. VAT
+  paymentType: "Bar" | "Karte" | null; // detected payment method, may be null
+  confidence:  "high" | "low";         // high = date AND amount both clearly found
 }
 
-const SYSTEM_PROMPT = `Du analysierst Bilder von Schweizer Kassenzetteln und Rechnungen.
-
-Du bekommst das ORIGINAL-BELEGBILD und zusätzlich einen OCR-Text als Hilfe.
-Der OCR-Text kann Fehler enthalten — vertraue immer dem Bild, nicht dem OCR-Text.
-Lies Datum und Betrag direkt aus dem Bild ab.
+const SYSTEM_PROMPT = `Du bist Experte für Schweizer Kassenzettel und Rechnungen.
+Du bekommst ein Foto eines Belegs und liest es selbst — du verlässt dich NICHT auf OCR.
 
 Gib ausschliesslich dieses JSON zurück (kein Markdown, kein Kommentar):
 {
   "date": "YYYY-MM-DD oder null",
-  "amount": "Zahl mit exakt 2 Dezimalstellen als String, z.B. \"82.10\", oder null",
+  "amount": "Totalbetrag inkl. MWST, exakt 2 Dezimalstellen als String, z.B. \"82.10\", oder null",
+  "paymentType": "Bar, Karte oder null",
   "confidence": "high oder low"
 }
 
-Regeln für "date":
-- Belegdatum verwenden (nicht Scan-Datum)
-- Format: YYYY-MM-DD
+DATUM:
+- Belegdatum / Kaufdatum verwenden (nicht ein Fälligkeits- oder Scan-Datum)
+- Format YYYY-MM-DD
 - Erlaubte Jahre: aktuelles Jahr und die zwei Vorjahre
-- Bei Unklarheit: null
+- Unklar → null
 
-Regeln für "amount" — VERWENDEN:
-- Total, Rechnungstotal, Gesamtbetrag, Total CHF, inkl. MWST, Brutto, Bruttobetrag
-- Zu bezahlen, Zu zahlen, ZU ZAHLEN, ZU BEZAHLEN
-- Betrag dankend erhalten
-- Grand Total
+BETRAG (der echte, zu bezahlende Rechnungsbetrag inkl. MWST):
+VERWENDEN:
+- Total, Rechnungstotal, Gesamttotal, Gesamtbetrag, Endbetrag, Total CHF, Brutto
+- "inkl. MWST", "Total inkl. MWST"
+- "Zu bezahlen", "Zu zahlen", "Betrag dankend erhalten", Grand Total
+- Bei mehreren Beträgen: der ENDGÜLTIGE zu zahlende Totalbetrag inkl. MWST
+NIEMALS VERWENDEN:
+- Rückgeld, Wechselgeld, Retourgeld
+- erhaltenes Bargeld, Gegeben, Bar gegeben, Geldeinwurf
+- Netto, Nettobetrag, Warenwert (Betrag vor MWST)
+- MWST-Betrag / Steueranteil allein
+- Liter, kg, Stück, Menge, Anzahl
+- Einzelpreis, Grundpreis, Literpreis
+- Wenn kein klares Total erkennbar → null
 
-Regeln für "amount" — IGNORIEREN:
-- Rückgeld, Wechselgeld, Retourgeld → nicht der Rechnungsbetrag
-- Bargeld erhalten, Geldeinwurf, Bezahlt, Kassiert → Zahlungsmittel, nicht Betrag
-- MWST-Betrag, Steuerbetrag → nur der Steueranteil, nicht Total
-- Netto, Nettobetrag, Warenwert, Grundbetrag → Betrag vor MWST
-- Menge, Liter, kg, Stk, Einzelpreis → keine Geldbeträge
-- Wenn Total UND Rückgeld vorhanden: immer Total verwenden
-- Wenn unsicher oder mehrere Beträge ohne klares Total: null
+ZAHLUNGSART:
+- "Karte" bei: EC, Maestro, Mastercard, Visa, Kreditkarte, Debit, kontaktlos, TWINT, Postcard
+- "Bar" bei: Bar, BAR, Barzahlung, Bargeld, oder wenn Rückgeld/Wechselgeld ausgewiesen ist
+- Nicht erkennbar → null
 
-confidence = "high" wenn Datum UND Betrag klar und eindeutig erkannt wurden.
-confidence = "low" wenn eines davon fehlt oder mehrdeutig ist.`;
+confidence = "high" NUR wenn Datum UND Betrag klar und eindeutig erkannt sind.
+confidence = "low" wenn eines fehlt oder mehrdeutig ist.`;
 
 export async function analyzeReceiptWithAi(
   imageDataUrl: string,   // JPEG/PNG data URL of the receipt — the AI reads this directly
-  ocrText:      string,   // OCR text as a hint only (may contain errors)
   apiKey:       string,
 ): Promise<AiReceiptResult | null> {
   if (!imageDataUrl) return null;
-
-  const hint = ocrText.trim()
-    ? `Zusätzlicher OCR-Text als Hilfe (kann Fehler enthalten, vertraue dem Bild):\n${ocrText.slice(0, 2000)}`
-    : "Kein OCR-Text verfügbar — lies alles direkt aus dem Bild.";
 
   try {
     const res = await fetch("https://api.openai.com/v1/chat/completions", {
@@ -74,7 +77,7 @@ export async function analyzeReceiptWithAi(
           {
             role: "user",
             content: [
-              { type: "text",      text: hint },
+              { type: "text",      text: "Lies diesen Beleg und gib das JSON zurück." },
               { type: "image_url", image_url: { url: imageDataUrl, detail: "high" } },
             ],
           },
@@ -103,12 +106,16 @@ export async function analyzeReceiptWithAi(
       parseFloat(parsed.amount) > 0
         ? parsed.amount : null;
 
+    const paymentType: "Bar" | "Karte" | null =
+      parsed.paymentType === "Bar"   ? "Bar"   :
+      parsed.paymentType === "Karte" ? "Karte" : null;
+
     const confidence: "high" | "low" =
       parsed.confidence === "high" && date !== null && amount !== null
         ? "high"
         : "low";
 
-    return { date, amount, confidence };
+    return { date, amount, paymentType, confidence };
   } catch {
     return null;   // network error, timeout, parse error — all handled gracefully
   }
