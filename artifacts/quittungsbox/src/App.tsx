@@ -1,6 +1,7 @@
 import { Router as WouterRouter, Route, Switch } from "wouter";
-import Home    from "@/pages/Home";
-import Archive from "@/pages/Archive";
+import Home          from "@/pages/Home";
+import Archive       from "@/pages/Archive";
+import InstallPrompt from "@/components/InstallPrompt";
 
 function App() {
   return (
@@ -10,6 +11,7 @@ function App() {
         <Route path="/archiv" component={Archive} />
         <Route path="*"       component={Home} />
       </Switch>
+      <InstallPrompt />
     </WouterRouter>
   );
 }
