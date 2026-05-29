@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { useLocation } from "wouter";
-import { scanImage, prepareScannedImage, canvasToBlob, canvasToDataUrl, applyOriginal, applyGrau, applyScan } from "@/lib/scanner";
+import { scanImage, prepareScannedImage, canvasToBlob, canvasToDataUrl, canvasToCompressedDataUrl, applyOriginal, applyGrau, applyScan } from "@/lib/scanner";
 import { runOcr, buildFileName } from "@/lib/ocr";
 import { generatePdfFromCanvas } from "@/lib/pdf";
 import { saveReceipt, getPruefenCount, getFolder, initFolderStructure, moveReceiptFile } from "@/lib/storage";
@@ -31,16 +31,17 @@ const MODES: { id: DisplayMode; label: string; hint: string }[] = [
 async function runBackgroundAi(
   savedFolder:   string,
   savedFileName: string,
+  imageDataUrl:  string,
   rawText:       string,
   paymentType:   PaymentType,
   pdfBlob:       Blob,
 ): Promise<void> {
   try {
-    if (!navigator.onLine || !rawText.trim()) return;
+    if (!navigator.onLine || !imageDataUrl) return;
     const [apiKey, aiOn] = await Promise.all([getOpenAiKey(), isAiEnabled()]);
     if (!apiKey || !aiOn) return;
 
-    const ai = await analyzeReceiptWithAi(rawText, apiKey);
+    const ai = await analyzeReceiptWithAi(imageDataUrl, rawText, apiKey);
     if (!ai || ai.confidence !== "high") return;
 
     const newFileName = buildFileName(paymentType, null, ai.amount, ai.date);
@@ -182,9 +183,13 @@ export default function Home() {
       setAppMode("done");
 
       // 4. AI enrichment runs in background — fire and forget.
+      //    The ORIGINAL receipt image is sent to the AI (vision), so it reads
+      //    the receipt directly and is not limited by OCR errors. OCR text is a hint.
       //    If it improves date/amount, it renames the file silently.
-      //    The user sees the improved name next time they open the archive.
-      void runBackgroundAi(folder, fileName, ocrResult.rawText, paymentType, pdfBlob);
+      const aiImage = canvasToCompressedDataUrl(
+        rawCanvasRef.current ?? displayCanvasRef.current,
+      );
+      void runBackgroundAi(folder, fileName, aiImage, ocrResult.rawText, paymentType, pdfBlob);
 
     } catch {
       setErrorMsg("PDF konnte nicht erstellt werden.");

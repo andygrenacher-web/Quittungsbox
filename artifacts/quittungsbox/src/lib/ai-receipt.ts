@@ -10,7 +10,11 @@ export interface AiReceiptResult {
   confidence: "high" | "low";  // high = date AND amount both clearly found
 }
 
-const SYSTEM_PROMPT = `Du analysierst OCR-Text von Schweizer Kassenzetteln und Rechnungen.
+const SYSTEM_PROMPT = `Du analysierst Bilder von Schweizer Kassenzetteln und Rechnungen.
+
+Du bekommst das ORIGINAL-BELEGBILD und zusätzlich einen OCR-Text als Hilfe.
+Der OCR-Text kann Fehler enthalten — vertraue immer dem Bild, nicht dem OCR-Text.
+Lies Datum und Betrag direkt aus dem Bild ab.
 
 Gib ausschliesslich dieses JSON zurück (kein Markdown, kein Kommentar):
 {
@@ -44,10 +48,15 @@ confidence = "high" wenn Datum UND Betrag klar und eindeutig erkannt wurden.
 confidence = "low" wenn eines davon fehlt oder mehrdeutig ist.`;
 
 export async function analyzeReceiptWithAi(
-  ocrText: string,
-  apiKey:  string,
+  imageDataUrl: string,   // JPEG/PNG data URL of the receipt — the AI reads this directly
+  ocrText:      string,   // OCR text as a hint only (may contain errors)
+  apiKey:       string,
 ): Promise<AiReceiptResult | null> {
-  if (!ocrText.trim()) return null;
+  if (!imageDataUrl) return null;
+
+  const hint = ocrText.trim()
+    ? `Zusätzlicher OCR-Text als Hilfe (kann Fehler enthalten, vertraue dem Bild):\n${ocrText.slice(0, 2000)}`
+    : "Kein OCR-Text verfügbar — lies alles direkt aus dem Bild.";
 
   try {
     const res = await fetch("https://api.openai.com/v1/chat/completions", {
@@ -59,13 +68,19 @@ export async function analyzeReceiptWithAi(
       body: JSON.stringify({
         model:                "gpt-4o-mini",
         response_format:      { type: "json_object" },
-        max_completion_tokens: 150,
+        max_completion_tokens: 200,
         messages: [
           { role: "system", content: SYSTEM_PROMPT },
-          { role: "user",   content: `OCR-Text:\n${ocrText.slice(0, 4000)}` },
+          {
+            role: "user",
+            content: [
+              { type: "text",      text: hint },
+              { type: "image_url", image_url: { url: imageDataUrl, detail: "high" } },
+            ],
+          },
         ],
       }),
-      signal: AbortSignal.timeout(15_000),
+      signal: AbortSignal.timeout(30_000),
     });
 
     if (!res.ok) return null;

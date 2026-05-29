@@ -497,6 +497,29 @@ export function canvasToDataUrl(canvas: HTMLCanvasElement): string {
 }
 
 /**
+ * Produce a compressed JPEG data URL, downscaled so the longest edge is at
+ * most maxDim. Used to send the receipt image to the AI vision model without
+ * shipping a huge payload.
+ */
+export function canvasToCompressedDataUrl(
+  canvas: HTMLCanvasElement,
+  maxDim  = 1400,
+  quality = 0.72,
+): string {
+  const { width, height } = canvas;
+  const scale = Math.min(1, maxDim / Math.max(width, height));
+  if (scale >= 1) return canvas.toDataURL("image/jpeg", quality);
+
+  const out = document.createElement("canvas");
+  out.width  = Math.round(width  * scale);
+  out.height = Math.round(height * scale);
+  const ctx = out.getContext("2d")!;
+  ctx.imageSmoothingQuality = "high";
+  ctx.drawImage(canvas, 0, 0, out.width, out.height);
+  return out.toDataURL("image/jpeg", quality);
+}
+
+/**
  * Prepare a pre-corrected image (e.g. from ML Kit Document Scanner) for
  * display and OCR without running the document detection pipeline.
  * Returns the same ScanResult shape so Home.tsx can use it identically.
