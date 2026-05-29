@@ -401,6 +401,9 @@ importers:
 
   artifacts/quittungsbox:
     dependencies:
+      '@capacitor-community/file-opener':
+        specifier: ^8.0.0
+        version: 8.0.0(@capacitor/core@8.3.4)
       '@capacitor-mlkit/document-scanner':
         specifier: ^8.1.0
         version: 8.1.0(@capacitor/core@8.3.4)
@@ -414,6 +417,9 @@ importers:
         specifier: ^8.1.2
         version: 8.1.2(@capacitor/core@8.3.4)
       '@capacitor/preferences':
+        specifier: ^8.0.1
+        version: 8.0.1(@capacitor/core@8.3.4)
+      '@capacitor/share':
         specifier: ^8.0.1
         version: 8.0.1(@capacitor/core@8.3.4)
       jspdf:
@@ -1255,6 +1261,12 @@ packages:
     resolution: {integrity: sha512-4zBIxpPzowiZpusoFkyGVwakdRJUyuH5PxQ/PrqghfdFWWasvnCdPfQXHrenDai+gyLARulZjZowCOj6fjT4pA==}
     engines: {node: '>=6.9.0'}
 
+  '@capacitor-community/file-opener@8.0.0':
+    resolution: {integrity: sha512-kbVNxt4G45RHHeOqrE1Z0nT5iOOzmZ3WwQytpUtaIPzDTlmZxVEA3nJYEiOfGFp6msZO6QWHK3k0Qbv7hnBx+w==}
+    engines: {node: '>=16.0.0', npm: '>=8.0.0'}
+    peerDependencies:
+      '@capacitor/core': '>=8.0.0'
+
   '@capacitor-mlkit/document-scanner@8.1.0':
     resolution: {integrity: sha512-+EK/MuWBAUPk2+Lw6jG4eSXn3pNayQsCkqiiVrFpSEh5pGpjo1k8admq4b4w/PaeTYud6KOzM4BwopEtauV1WA==}
     peerDependencies:
@@ -1285,6 +1297,11 @@ packages:
 
   '@capacitor/preferences@8.0.1':
     resolution: {integrity: sha512-T6no3ebi79XJCk91U3Jp/liJUwgBdvHR+s6vhvPkPxSuch7z3zx5Rv1bdWM6sWruNx+pViuEGqZvbfCdyBvcHQ==}
+    peerDependencies:
+      '@capacitor/core': '>=8.0.0'
+
+  '@capacitor/share@8.0.1':
+    resolution: {integrity: sha512-3cSBKBCJVon54rKDROP2rqGyeGks4pBh9TbaEk9S375Kbek/ZHe72N50zIa0Vn9Eac/SuhwgehO/mmA4CsUOiw==}
     peerDependencies:
       '@capacitor/core': '>=8.0.0'
 
@@ -5502,6 +5519,10 @@ snapshots:
       '@babel/helper-string-parser': 7.29.7
       '@babel/helper-validator-identifier': 7.29.7
 
+  '@capacitor-community/file-opener@8.0.0(@capacitor/core@8.3.4)':
+    dependencies:
+      '@capacitor/core': 8.3.4
+
   '@capacitor-mlkit/document-scanner@8.1.0(@capacitor/core@8.3.4)':
     dependencies:
       '@capacitor/core': 8.3.4
@@ -5546,6 +5567,10 @@ snapshots:
       '@capacitor/synapse': 1.0.4
 
   '@capacitor/preferences@8.0.1(@capacitor/core@8.3.4)':
+    dependencies:
+      '@capacitor/core': 8.3.4
+
+  '@capacitor/share@8.0.1(@capacitor/core@8.3.4)':
     dependencies:
       '@capacitor/core': 8.3.4
 

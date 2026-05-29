@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useState } from "react";
 import { useLocation } from "wouter";
-import { getAllReceipts, deleteReceipt, loadReceiptBlob, type ReceiptRecord } from "@/lib/storage";
+import { getAllReceipts, deleteReceipt, type ReceiptRecord } from "@/lib/storage";
 import { isNative } from "@/lib/platform";
+import { openPdf, sharePdf } from "@/lib/pdf-actions";
 
 // ── folder tree helpers ────────────────────────────────────
 
@@ -49,58 +50,38 @@ function countReceipts(node: FolderNode): number {
 
 // ── receipt actions ────────────────────────────────────────
 
-async function getBlobSafe(r: ReceiptRecord): Promise<Blob | null> {
-  try { return await loadReceiptBlob(r); } catch { return null; }
-}
-
-async function openPdf(r: ReceiptRecord) {
-  const blob = await getBlobSafe(r);
-  if (!blob) { alert("PDF konnte nicht geladen werden."); return; }
-  const url = URL.createObjectURL(blob);
-  window.open(url, "_blank");
-  setTimeout(() => URL.revokeObjectURL(url), 30_000);
-}
-
-async function sharePdf(r: ReceiptRecord) {
-  const blob = await getBlobSafe(r);
-  if (!blob) { alert("PDF konnte nicht geladen werden."); return; }
-  const file = new File([blob], r.fileName, { type: "application/pdf" });
-  if (navigator.canShare?.({ files: [file] })) {
-    try { await navigator.share({ files: [file], title: r.fileName }); return; } catch { /* fall through */ }
-  }
-  // Fallback: browser download
-  const url = URL.createObjectURL(blob);
-  const a   = document.createElement("a");
-  a.href = url; a.download = r.fileName; a.click();
-  setTimeout(() => URL.revokeObjectURL(url), 5_000);
-}
+// openPdf / sharePdf imported from @/lib/pdf-actions
+// They handle the Android content:// URI + FileProvider flow.
 
 async function exportToFolder(r: ReceiptRecord) {
-  const blob = await getBlobSafe(r);
-  if (!blob) { alert("PDF konnte nicht geladen werden."); return; }
-
-  if (isNative()) {
-    // Re-save (or overwrite) the file in Documents/Quittungsbox/…
-    const { Filesystem, Directory } = await import("@capacitor/filesystem");
-    const reader = new FileReader();
-    const b64 = await new Promise<string>((res, rej) => {
-      reader.onload  = () => res((reader.result as string).split(",")[1]);
-      reader.onerror = () => rej(reader.error);
-      reader.readAsDataURL(blob);
-    });
-    await Filesystem.writeFile({
-      path:      `Quittungsbox/${r.folder}/${r.fileName}`,
-      data:      b64,
-      directory: Directory.Documents,
-      recursive: true,
-    });
-    alert(`Gespeichert unter:\nDokumente/Quittungsbox/${r.folder}/`);
-  } else {
-    // Web: trigger download
-    const url = URL.createObjectURL(blob);
-    const a   = document.createElement("a");
-    a.href = url; a.download = r.fileName; a.click();
-    setTimeout(() => URL.revokeObjectURL(url), 5_000);
+  try {
+    if (isNative()) {
+      const { Filesystem, Directory } = await import("@capacitor/filesystem");
+      const { loadReceiptBlob }       = await import("@/lib/storage");
+      const blob = await loadReceiptBlob(r);
+      const reader = new FileReader();
+      const b64 = await new Promise<string>((res, rej) => {
+        reader.onload  = () => res((reader.result as string).split(",")[1]);
+        reader.onerror = () => rej(reader.error);
+        reader.readAsDataURL(blob);
+      });
+      await Filesystem.writeFile({
+        path:      `Quittungsbox/${r.folder}/${r.fileName}`,
+        data:      b64,
+        directory: Directory.Documents,
+        recursive: true,
+      });
+      alert(`Gespeichert unter:\nDokumente/Quittungsbox/${r.folder}/`);
+    } else {
+      const { loadReceiptBlob } = await import("@/lib/storage");
+      const blob = await loadReceiptBlob(r);
+      const url  = URL.createObjectURL(blob);
+      const a    = Object.assign(document.createElement("a"), { href: url, download: r.fileName });
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(url), 5_000);
+    }
+  } catch {
+    alert("Fehler beim Speichern. Bitte nochmal versuchen.");
   }
 }
 
@@ -186,7 +167,10 @@ function ReceiptRow({ r, onDelete }: { r: ReceiptRecord; onDelete: () => void })
         <ActionBtn
           label="Öffnen"
           busy={busy === "open"}
-          onClick={() => run("open", () => openPdf(r))}
+          onClick={() => run("open", async () => {
+            try { await openPdf(r); }
+            catch { alert("PDF konnte nicht geöffnet werden."); }
+          })}
           icon={
             <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
               <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
@@ -199,7 +183,10 @@ function ReceiptRow({ r, onDelete }: { r: ReceiptRecord; onDelete: () => void })
         <ActionBtn
           label="Teilen"
           busy={busy === "share"}
-          onClick={() => run("share", () => sharePdf(r))}
+          onClick={() => run("share", async () => {
+            try { await sharePdf(r); }
+            catch { alert("Teilen fehlgeschlagen."); }
+          })}
           icon={
             <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
               <circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/>
