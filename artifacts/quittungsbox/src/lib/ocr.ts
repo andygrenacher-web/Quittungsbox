@@ -41,8 +41,10 @@ function extractDate(text: string): string | null {
 }
 
 function isValidDate(d: Date): boolean {
-  return d instanceof Date && !isNaN(d.getTime()) &&
-    d.getFullYear() >= 2000 && d.getFullYear() <= 2099;
+  if (!(d instanceof Date) || isNaN(d.getTime())) return false;
+  const y    = d.getFullYear();
+  const curr = new Date().getFullYear();
+  return y >= curr - 2 && y <= curr;
 }
 
 // ── amount extraction ────────────────────────────────────────────────────────

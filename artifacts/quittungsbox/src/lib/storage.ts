@@ -42,15 +42,21 @@ export async function initFolderStructure(): Promise<void> {
   if (!isNative()) return;
   const { Filesystem, Directory } = await import("@capacitor/filesystem");
 
-  const year = new Date().getFullYear();
+  const curr = new Date().getFullYear();
+  const validYears = [curr - 2, curr - 1, curr];
+
+  const monthFolders = validYears.flatMap(year =>
+    MONTHS_DE.map((name, i) => {
+      const m = String(i + 1).padStart(2, "0");
+      return `Quittungsbox/Archiv/${year}/${m} ${name}`;
+    })
+  );
+
   const folders = [
     "Quittungsbox/Prüfen/Kein Datum",
     "Quittungsbox/Prüfen/Kein Betrag",
     "Quittungsbox/Prüfen/OCR Fehler",
-    ...MONTHS_DE.map((name, i) => {
-      const m = String(i + 1).padStart(2, "0");
-      return `Quittungsbox/Archiv/${year}/${m} ${name}`;
-    }),
+    ...monthFolders,
   ];
 
   for (const folder of folders) {
