@@ -94,8 +94,13 @@ export default function Home() {
       const result = await capturePhoto();
       if (!result) return; // user cancelled
       handleCapture(pt, result.blob, result.alreadyCorrected);
-    } catch {
-      // user cancelled — do nothing, stay on idle screen
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      // Silently ignore genuine cancellations
+      if (/cancelled|cancel|dismiss/i.test(msg)) return;
+      // Show all other errors so we can diagnose
+      setErrorMsg("Kamera-Fehler: " + msg);
+      setAppMode("error");
     }
   }
 
