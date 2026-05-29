@@ -5,6 +5,7 @@ export interface OcrResult {
   amount: string | null;
   receiptDate: string | null; // YYYY-MM-DD extracted from receipt, or null
   rawText: string;
+  ocrFailed: boolean;
 }
 
 // ── date extraction ────────────────────────────────────────
@@ -139,9 +140,9 @@ export async function runOcr(imageBlob: Blob): Promise<OcrResult> {
       logger: () => {},
     });
     const { vendor, amount, receiptDate } = parseOcrText(result.data.text);
-    return { vendor, amount, receiptDate, rawText: result.data.text };
+    return { vendor, amount, receiptDate, rawText: result.data.text, ocrFailed: false };
   } catch {
-    return { vendor: null, amount: null, receiptDate: null, rawText: "" };
+    return { vendor: null, amount: null, receiptDate: null, rawText: "", ocrFailed: true };
   }
 }
 
