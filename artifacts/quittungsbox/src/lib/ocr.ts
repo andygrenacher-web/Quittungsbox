@@ -49,23 +49,25 @@ function isValidDate(d: Date): boolean {
 
 // ── amount extraction ────────────────────────────────────────────────────────
 
-// Strong total keywords: definitive payment lines
-const STRONG_TOTAL = /\b(Gesamttotal|Totalbetrag|Gesamtbetrag|Endbetrag|Rechnungsbetrag|ZU\s+ZAHLEN|ZU\s+BEZAHLEN|zu\s+bezahlen|zu\s+zahlen|Zu\s+zahlen|Zu\s+bezahlen|BEZAHLT|Bezahlt|Kassiert)\b/i;
+// Highest priority: unambiguous final payment lines
+const STRONG_TOTAL = /\b(Rechnungstotal|Gesamttotal|Totalbetrag|Gesamtbetrag|Endbetrag|Rechnungsbetrag|ZU\s+ZAHLEN|ZU\s+BEZAHLEN|zu\s+bezahlen|zu\s+zahlen|Zu\s+zahlen|Zu\s+bezahlen|BEZAHLT|Bezahlt|Kassiert|dankend\s+erhalten|Betrag\s+erhalten|inkl\.?\s*MWST|inkl\.?\s*MwSt)\b/i;
 
-// Standard total keywords
-const TOTAL_KW = /\b(Total|TOTAL|Betrag|Summe|Gesamt|Zahlung|Zahlen|Grand\s+total)\b|(?<!\w)CHF(?!\w)/i;
+// Standard total keywords (lower priority than STRONG_TOTAL)
+const TOTAL_KW = /\b(Total|Summe|Gesamt|Zahlung|Zahlen|Grand\s+total)\b|(?<!\w)CHF(?!\w)/i;
 
 // Lines to EXCLUDE from amount detection.
-// Excludes: quantities, weights, volumes, tax, tank/pump specific, reference numbers,
-// unit prices, and cross-multiplication (e.g. "3 × 4.50").
+// Excludes: net amounts, quantities, weights, volumes, tax lines, unit prices,
+// tank/pump specific terms, reference numbers, discounts.
 const EXCL_KW = new RegExp(
   String.raw`\b(` +
-    // Quantities & units
-    String.raw`Menge|Anzahl|Liter|Ltr\.?|Lite?r|kg|g\b|Stk\.?|Stück|` +
-    // Price-per-unit
-    String.raw`Einzel|Grundpreis|Literpreis|Einheitspreis|` +
-    // Tax
+    // Net / pre-tax amounts — we want the gross total, not netto
+    String.raw`Netto|Nettobetrag|Nettosumme|Netto-Betrag|Warenwert|Grundbetrag|` +
+    // Tax amount lines (the VAT component, not the total)
     String.raw`MWST|MwSt|USt|Ust\.|Steuer|` +
+    // Quantities & units
+    String.raw`Menge|Anzahl|Liter|Ltr\.?|kg|Stk\.?|Stück|` +
+    // Price-per-unit / unit prices
+    String.raw`Einzel|Einzelpreis|Grundpreis|Literpreis|Einheitspreis|` +
     // Tank / fuel receipts
     String.raw`Tankautomat|Zapfpunkt|Zapfsäule|` +
     // Reference numbers
@@ -73,7 +75,7 @@ const EXCL_KW = new RegExp(
     // Discount / deposit
     String.raw`Rabatt|Pfand` +
   String.raw`)\b` +
-  // Unit-price patterns: /l, /kg, pro l, ×/x quantity
+  // Unit-price patterns: /l, /kg, pro l
   String.raw`|\bpro\s+(kg|l|Ltr|Stk)\b` +
   String.raw`|\/\s*(kg|l|Ltr)\b` +
   String.raw`|\bPreis\s*\/` +

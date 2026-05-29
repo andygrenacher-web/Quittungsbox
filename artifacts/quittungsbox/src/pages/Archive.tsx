@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { useLocation } from "wouter";
 import { getAllReceipts, deleteReceipt, loadReceiptBlob, type ReceiptRecord } from "@/lib/storage";
+import { isNative } from "@/lib/platform";
 
 // ── folder tree helpers ────────────────────────────────────
 
@@ -46,72 +47,180 @@ function countReceipts(node: FolderNode): number {
   return node.receipts.length + node.children.reduce((s, c) => s + countReceipts(c), 0);
 }
 
-// ── download / share ───────────────────────────────────────
+// ── receipt actions ────────────────────────────────────────
 
-async function shareOrDownload(r: ReceiptRecord) {
-  // loadReceiptBlob handles both web (already in record) and Android (reads Filesystem)
-  const blob = await loadReceiptBlob(r);
+async function getBlobSafe(r: ReceiptRecord): Promise<Blob | null> {
+  try { return await loadReceiptBlob(r); } catch { return null; }
+}
+
+async function openPdf(r: ReceiptRecord) {
+  const blob = await getBlobSafe(r);
+  if (!blob) { alert("PDF konnte nicht geladen werden."); return; }
+  const url = URL.createObjectURL(blob);
+  window.open(url, "_blank");
+  setTimeout(() => URL.revokeObjectURL(url), 30_000);
+}
+
+async function sharePdf(r: ReceiptRecord) {
+  const blob = await getBlobSafe(r);
+  if (!blob) { alert("PDF konnte nicht geladen werden."); return; }
   const file = new File([blob], r.fileName, { type: "application/pdf" });
   if (navigator.canShare?.({ files: [file] })) {
     try { await navigator.share({ files: [file], title: r.fileName }); return; } catch { /* fall through */ }
   }
-  // Fallback: trigger browser download
+  // Fallback: browser download
   const url = URL.createObjectURL(blob);
   const a   = document.createElement("a");
   a.href = url; a.download = r.fileName; a.click();
-  setTimeout(() => URL.revokeObjectURL(url), 5000);
+  setTimeout(() => URL.revokeObjectURL(url), 5_000);
+}
+
+async function exportToFolder(r: ReceiptRecord) {
+  const blob = await getBlobSafe(r);
+  if (!blob) { alert("PDF konnte nicht geladen werden."); return; }
+
+  if (isNative()) {
+    // Re-save (or overwrite) the file in Documents/Quittungsbox/…
+    const { Filesystem, Directory } = await import("@capacitor/filesystem");
+    const reader = new FileReader();
+    const b64 = await new Promise<string>((res, rej) => {
+      reader.onload  = () => res((reader.result as string).split(",")[1]);
+      reader.onerror = () => rej(reader.error);
+      reader.readAsDataURL(blob);
+    });
+    await Filesystem.writeFile({
+      path:      `Quittungsbox/${r.folder}/${r.fileName}`,
+      data:      b64,
+      directory: Directory.Documents,
+      recursive: true,
+    });
+    alert(`Gespeichert unter:\nDokumente/Quittungsbox/${r.folder}/`);
+  } else {
+    // Web: trigger download
+    const url = URL.createObjectURL(blob);
+    const a   = document.createElement("a");
+    a.href = url; a.download = r.fileName; a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 5_000);
+  }
 }
 
 // ── sub-components ─────────────────────────────────────────
 
-function ReceiptRow({ r, onDelete }: { r: ReceiptRecord; onDelete: () => void }) {
-  const [sharing, setSharing] = useState(false);
+type Action = "open" | "share" | "export";
 
-  async function handleShare() {
-    setSharing(true);
-    try { await shareOrDownload(r); } finally { setSharing(false); }
+function ActionBtn({
+  icon, label, busy, onClick,
+}: {
+  icon: React.ReactNode;
+  label: string;
+  busy: boolean;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      onClick={onClick}
+      disabled={busy}
+      className="flex-1 flex flex-col items-center gap-0.5 py-2 rounded-xl active:bg-accent disabled:opacity-40 transition-opacity"
+      style={{ background: "hsl(0 0% 96%)" }}
+    >
+      {busy ? (
+        <svg className="animate-spin w-4 h-4 text-muted-foreground" viewBox="0 0 24 24" fill="none">
+          <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="3" strokeDasharray="31.4" strokeDashoffset="10"/>
+        </svg>
+      ) : icon}
+      <span className="text-[10px] font-medium text-muted-foreground leading-none">{label}</span>
+    </button>
+  );
+}
+
+function ReceiptRow({ r, onDelete }: { r: ReceiptRecord; onDelete: () => void }) {
+  const [busy, setBusy] = useState<Action | null>(null);
+
+  async function run(action: Action, fn: () => Promise<void>) {
+    setBusy(action);
+    try { await fn(); } finally { setBusy(null); }
   }
 
+  const isPrüfen = r.folder.startsWith("Prüfen");
+
   return (
-    <div className="flex items-center gap-2 py-2.5 px-3 rounded-xl bg-muted/60 border border-border">
-      <div className="flex-1 min-w-0">
-        <p className="text-xs font-mono text-foreground truncate">{r.fileName}</p>
-        {r.amount && (
-          <p className="text-xs text-muted-foreground mt-0.5">
-            {r.amount} CHF · {r.paymentType}
-          </p>
-        )}
+    <div className="rounded-2xl border border-border bg-card overflow-hidden mb-2">
+      {/* File info */}
+      <div className="px-3 pt-2.5 pb-2 flex items-start gap-2">
+        <div className="flex-1 min-w-0">
+          <p className="text-xs font-mono text-foreground truncate leading-tight">{r.fileName}</p>
+          <div className="flex flex-wrap gap-1.5 mt-1">
+            {r.amount && (
+              <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-muted text-muted-foreground font-medium">
+                {r.amount} CHF
+              </span>
+            )}
+            <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-muted text-muted-foreground font-medium">
+              {r.paymentType}
+            </span>
+            {isPrüfen && (
+              <span className="text-[10px] px-1.5 py-0.5 rounded-full font-medium"
+                style={{ background: "hsl(45 100% 93%)", color: "hsl(30 80% 35%)" }}>
+                ⚠️ Zu prüfen
+              </span>
+            )}
+          </div>
+        </div>
+        {/* Delete */}
+        <button
+          onClick={onDelete}
+          className="p-1.5 rounded-lg active:bg-muted text-muted-foreground shrink-0 mt-0.5"
+          title="Löschen"
+        >
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <polyline points="3,6 5,6 21,6"/>
+            <path d="M19 6l-1 14H6L5 6"/>
+            <path d="M10 11v6M14 11v6"/>
+            <path d="M9 6V4h6v2"/>
+          </svg>
+        </button>
       </div>
-      <button
-        onClick={handleShare}
-        disabled={sharing}
-        className="p-2 rounded-lg active:bg-muted text-muted-foreground shrink-0 disabled:opacity-40"
-        title="Herunterladen / Teilen"
-      >
-        {sharing ? (
-          <svg className="animate-spin w-4 h-4" viewBox="0 0 24 24" fill="none">
-            <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="3" strokeDasharray="31.4" strokeDashoffset="10"/>
-          </svg>
-        ) : (
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
-            <polyline points="7,10 12,15 17,10"/>
-            <line x1="12" y1="15" x2="12" y2="3"/>
-          </svg>
-        )}
-      </button>
-      <button
-        onClick={onDelete}
-        className="p-2 rounded-lg active:bg-muted text-muted-foreground shrink-0"
-        title="Löschen"
-      >
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-          <polyline points="3,6 5,6 21,6"/>
-          <path d="M19 6l-1 14H6L5 6"/>
-          <path d="M10 11v6M14 11v6"/>
-          <path d="M9 6V4h6v2"/>
-        </svg>
-      </button>
+
+      {/* Action buttons */}
+      <div className="flex gap-1 px-2 pb-2">
+        <ActionBtn
+          label="Öffnen"
+          busy={busy === "open"}
+          onClick={() => run("open", () => openPdf(r))}
+          icon={
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+              <polyline points="14,2 14,8 20,8"/>
+              <line x1="16" y1="13" x2="8" y2="13"/>
+              <line x1="16" y1="17" x2="8" y2="17"/>
+            </svg>
+          }
+        />
+        <ActionBtn
+          label="Teilen"
+          busy={busy === "share"}
+          onClick={() => run("share", () => sharePdf(r))}
+          icon={
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/>
+              <line x1="8.59" y1="13.51" x2="15.42" y2="17.49"/>
+              <line x1="15.41" y1="6.51" x2="8.59" y2="10.49"/>
+            </svg>
+          }
+        />
+        <ActionBtn
+          label={isNative() ? "In Ordner" : "Download"}
+          busy={busy === "export"}
+          onClick={() => run("export", () => exportToFolder(r))}
+          icon={
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+              <polyline points="7,10 12,15 17,10"/>
+              <line x1="12" y1="15" x2="12" y2="3"/>
+            </svg>
+          }
+        />
+      </div>
     </div>
   );
 }
@@ -164,7 +273,7 @@ function FolderSection({
             <FolderSection key={child.fullPath} node={child} depth={depth + 1} onDelete={onDelete} />
           ))}
           {node.receipts.length > 0 && (
-            <div className="flex flex-col gap-1.5 mt-1" style={{ paddingLeft: (depth + 1) * 14 + 22 }}>
+            <div className="mt-1" style={{ paddingLeft: (depth + 1) * 14 + 8 }}>
               {node.receipts
                 .slice()
                 .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
@@ -250,7 +359,7 @@ export default function Archive() {
               Zu prüfen: {prüfenCount} Beleg{prüfenCount !== 1 ? "e" : ""}
             </p>
             <p className="text-xs mt-0.5" style={{ color: "hsl(30 60% 45%)" }}>
-              Datum oder OCR nicht erkannt
+              Datum oder OCR nicht erkannt — PDF trotzdem gespeichert
             </p>
           </div>
         </div>
