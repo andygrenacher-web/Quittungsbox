@@ -1,12 +1,13 @@
 import { useEffect, useRef, useState } from "react";
 import { useLocation } from "wouter";
-import { scanImage, canvasToBlob, canvasToDataUrl } from "@/lib/scanner";
+import { scanImage, canvasToBlob, canvasToDataUrl, applyOriginal, applyGrau, applyScan } from "@/lib/scanner";
 import { runOcr, buildFileName } from "@/lib/ocr";
 import { generatePdfFromCanvas } from "@/lib/pdf";
 import { saveReceipt, getPruefenCount, getFolder } from "@/lib/storage";
 
-type PaymentType = "Bar" | "Karte";
-type AppMode = "idle" | "scanning" | "preview" | "processing" | "done" | "error";
+type PaymentType  = "Bar" | "Karte";
+type AppMode      = "idle" | "scanning" | "preview" | "processing" | "done" | "error";
+type DisplayMode  = "original" | "grau" | "scan";
 
 interface DoneState {
   fileName: string;
@@ -14,19 +15,31 @@ interface DoneState {
   pdfBlob:  Blob;
 }
 
+const MODES: { id: DisplayMode; label: string; hint: string }[] = [
+  { id: "original", label: "Original",    hint: "Farbbild" },
+  { id: "grau",     label: "Graustufen",  hint: "Standard" },
+  { id: "scan",     label: "Scan",        hint: "Höherer Kontrast" },
+];
+
 export default function Home() {
   const [, setLocation] = useLocation();
 
-  const [mode,         setMode]         = useState<AppMode>("idle");
+  const [appMode,      setAppMode]      = useState<AppMode>("idle");
   const [paymentType,  setPaymentType]  = useState<PaymentType | null>(null);
   const [scanStatus,   setScanStatus]   = useState("");
   const [previewUrl,   setPreviewUrl]   = useState("");
   const [corrected,    setCorrected]    = useState(false);
+  const [displayMode,  setDisplayMode]  = useState<DisplayMode>("grau");
   const [done,         setDone]         = useState<DoneState | null>(null);
   const [errorMsg,     setErrorMsg]     = useState("");
   const [pruefenCount, setPruefenCount] = useState(0);
 
-  const scannedCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  // rawCanvas = warped colour (source for mode switching)
+  // ocrCanvas = always "grau" (best for Tesseract, pre-computed once)
+  // displayCanvas = currently selected mode (used for PDF)
+  const rawCanvasRef     = useRef<HTMLCanvasElement | null>(null);
+  const ocrCanvasRef     = useRef<HTMLCanvasElement | null>(null);
+  const displayCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const barRef           = useRef<HTMLInputElement>(null);
   const karteRef         = useRef<HTMLInputElement>(null);
 
@@ -36,57 +49,73 @@ export default function Home() {
 
   useEffect(() => { loadPruefenCount(); }, []);
 
+  // ── mode switching ─────────────────────────────────────────
+
+  function switchMode(mode: DisplayMode) {
+    if (!rawCanvasRef.current) return;
+    let c: HTMLCanvasElement;
+    if      (mode === "original") c = applyOriginal(rawCanvasRef.current);
+    else if (mode === "grau")     c = ocrCanvasRef.current!;
+    else                          c = applyScan(rawCanvasRef.current);
+    displayCanvasRef.current = c;
+    setPreviewUrl(canvasToDataUrl(c));
+    setDisplayMode(mode);
+  }
+
   // ── capture ────────────────────────────────────────────────
 
   async function handleCapture(pt: PaymentType, file: File) {
     setPaymentType(pt);
-    setMode("scanning");
+    setAppMode("scanning");
     setScanStatus("Beleg wird erkannt …");
     try {
-      const { canvas, corrected: cor } = await scanImage(new Blob([file], { type: file.type }));
-      scannedCanvasRef.current = canvas;
+      const { rawCanvas, canvas: grauCanvas, corrected: cor } = await scanImage(
+        new Blob([file], { type: file.type })
+      );
+      rawCanvasRef.current     = rawCanvas;
+      ocrCanvasRef.current     = grauCanvas;
+      displayCanvasRef.current = grauCanvas;
       setCorrected(cor);
-      setPreviewUrl(canvasToDataUrl(canvas));
-      setMode("preview");
+      setDisplayMode("grau");
+      setPreviewUrl(canvasToDataUrl(grauCanvas));
+      setAppMode("preview");
     } catch {
       setErrorMsg("Scan fehlgeschlagen. Bitte nochmal versuchen.");
-      setMode("error");
+      setAppMode("error");
     }
   }
 
-  // ── save (OCR + PDF + archive) ─────────────────────────────
+  // ── save (OCR on grau canvas, PDF on display-mode canvas) ─
 
   async function handleSave() {
-    const canvas = scannedCanvasRef.current;
-    if (!canvas || !paymentType) return;
-    setMode("processing");
+    if (!displayCanvasRef.current || !ocrCanvasRef.current || !paymentType) return;
+    setAppMode("processing");
     setScanStatus("OCR läuft …");
     try {
-      const imgBlob   = await canvasToBlob(canvas);
-      const ocrResult = await runOcr(imgBlob);
+      // OCR always uses the grayscale version (best accuracy)
+      const ocrBlob   = await canvasToBlob(ocrCanvasRef.current);
+      const ocrResult = await runOcr(ocrBlob);
 
       setScanStatus("PDF wird erstellt …");
-      const pdfBlob  = await generatePdfFromCanvas(canvas, ocrResult.rawText);
+      // PDF uses whichever display mode the user selected
+      const pdfBlob  = await generatePdfFromCanvas(displayCanvasRef.current, ocrResult.rawText);
       const fileName = buildFileName(paymentType, ocrResult.vendor, ocrResult.amount, ocrResult.receiptDate);
       const folder   = getFolder(ocrResult.receiptDate, ocrResult.ocrFailed);
 
       await saveReceipt({
-        fileName,
-        folder,
-        pdfBlob,
+        fileName, folder, pdfBlob,
         createdAt:   new Date().toISOString(),
         receiptDate: ocrResult.receiptDate,
         amount:      ocrResult.amount,
-        paymentType,
-        ocrFailed:   ocrResult.ocrFailed,
+        paymentType, ocrFailed: ocrResult.ocrFailed,
       });
 
       await loadPruefenCount();
       setDone({ fileName, folder, pdfBlob });
-      setMode("done");
+      setAppMode("done");
     } catch {
       setErrorMsg("PDF konnte nicht erstellt werden.");
-      setMode("error");
+      setAppMode("error");
     }
   }
 
@@ -95,8 +124,7 @@ export default function Home() {
   function downloadPdf() {
     if (!done) return;
     const url = URL.createObjectURL(done.pdfBlob);
-    const a = document.createElement("a");
-    a.href = url; a.download = done.fileName; a.click();
+    const a = document.createElement("a"); a.href=url; a.download=done.fileName; a.click();
     setTimeout(() => URL.revokeObjectURL(url), 5000);
   }
 
@@ -104,24 +132,21 @@ export default function Home() {
     if (!done) return;
     const file = new File([done.pdfBlob], done.fileName, { type: "application/pdf" });
     if (navigator.canShare?.({ files: [file] })) {
-      try { await navigator.share({ files: [file], title: done.fileName }); return; }
-      catch { /* fall through */ }
+      try { await navigator.share({ files: [file], title: done.fileName }); return; } catch {}
     }
     downloadPdf();
   }
 
   function reset() {
-    scannedCanvasRef.current = null;
-    setMode("idle"); setDone(null); setPreviewUrl("");
-    setPaymentType(null); setErrorMsg("");
+    rawCanvasRef.current = null; ocrCanvasRef.current = null; displayCanvasRef.current = null;
+    setAppMode("idle"); setDone(null); setPreviewUrl(""); setPaymentType(null); setErrorMsg("");
+    setDisplayMode("grau");
   }
 
   function onFileChange(pt: PaymentType) {
     return (e: React.ChangeEvent<HTMLInputElement>) => {
-      const file = e.target.files?.[0];
-      if (!file) return;
-      e.target.value = "";
-      handleCapture(pt, file);
+      const file = e.target.files?.[0]; if (!file) return;
+      e.target.value = ""; handleCapture(pt, file);
     };
   }
 
@@ -145,15 +170,10 @@ export default function Home() {
           <h1 className="text-xl font-bold text-foreground leading-none">Quittungsbox</h1>
           <p className="text-xs text-muted-foreground mt-0.5">Beleg fotografieren, fertig.</p>
         </div>
-
-        {/* Archive button */}
-        <button
-          onClick={() => setLocation("/archiv")}
-          className="relative h-9 px-3 rounded-xl bg-muted flex items-center gap-1.5 active:bg-accent text-sm font-medium text-foreground"
-        >
+        <button onClick={() => setLocation("/archiv")}
+          className="relative h-9 px-3 rounded-xl bg-muted flex items-center gap-1.5 active:bg-accent text-sm font-medium text-foreground">
           <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-            <polyline points="21,8 21,21 3,21 3,8"/>
-            <rect x="1" y="3" width="22" height="5"/>
+            <polyline points="21,8 21,21 3,21 3,8"/><rect x="1" y="3" width="22" height="5"/>
             <line x1="10" y1="12" x2="14" y2="12"/>
           </svg>
           Archiv
@@ -169,7 +189,7 @@ export default function Home() {
       <main className="flex-1 flex flex-col justify-center px-5 gap-4 pb-8">
 
         {/* ── IDLE ── */}
-        {mode === "idle" && (
+        {appMode === "idle" && (
           <>
             <p className="text-center text-sm text-muted-foreground mb-2">Womit wurde bezahlt?</p>
 
@@ -206,7 +226,7 @@ export default function Home() {
         )}
 
         {/* ── SCANNING / PROCESSING ── */}
-        {(mode === "scanning" || mode === "processing") && (
+        {(appMode === "scanning" || appMode === "processing") && (
           <div className="flex flex-col items-center justify-center gap-6 py-12">
             <div className="relative w-24 h-24">
               <svg className="animate-spin w-24 h-24" viewBox="0 0 96 96" fill="none">
@@ -214,16 +234,10 @@ export default function Home() {
                 <path d="M48 8 a40 40 0 0 1 40 40" stroke="hsl(142 55% 36%)" strokeWidth="8" strokeLinecap="round"/>
               </svg>
               <div className="absolute inset-0 flex items-center justify-center">
-                {mode === "scanning" ? (
-                  <svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="hsl(142 55% 36%)" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                    <polyline points="5,3 5,21 19,3 19,21"/><line x1="5" y1="12" x2="19" y2="12"/>
-                  </svg>
-                ) : (
-                  <svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="hsl(142 55% 36%)" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                    <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
-                    <polyline points="14,2 14,8 20,8"/>
-                  </svg>
-                )}
+                <svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="hsl(142 55% 36%)" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+                  <polyline points="14,2 14,8 20,8"/>
+                </svg>
               </div>
             </div>
             <div className="text-center">
@@ -234,20 +248,39 @@ export default function Home() {
         )}
 
         {/* ── PREVIEW ── */}
-        {mode === "preview" && previewUrl && (
-          <div className="flex flex-col gap-4">
-            <div className="flex items-center justify-between">
-              <p className="text-sm font-medium text-foreground">Vorschau</p>
+        {appMode === "preview" && previewUrl && (
+          <div className="flex flex-col gap-3">
+            {/* Mode selector */}
+            <div className="flex items-center gap-1 p-1 rounded-xl bg-muted">
+              {MODES.map(m => (
+                <button key={m.id} onClick={() => switchMode(m.id)}
+                  className="flex-1 py-1.5 rounded-lg text-xs font-semibold transition-all duration-150"
+                  style={displayMode === m.id
+                    ? { background: "white", color: "hsl(142 55% 30%)", boxShadow: "0 1px 3px rgba(0,0,0,0.15)" }
+                    : { color: "hsl(0 0% 45%)" }}>
+                  {m.label}
+                </button>
+              ))}
+            </div>
+
+            {/* Preview image */}
+            <div className="rounded-2xl overflow-hidden border border-border shadow-sm bg-card max-h-[52vh] flex items-center justify-center">
+              <img src={previewUrl} alt="Scan-Vorschau" className="max-w-full max-h-[52vh] object-contain block" />
+            </div>
+
+            {/* Badges */}
+            <div className="flex items-center gap-2 flex-wrap">
               {corrected && (
                 <span className="text-xs font-medium px-2.5 py-1 rounded-full"
                   style={{ background: "hsl(142 55% 36% / 0.12)", color: "hsl(142 55% 30%)" }}>
                   ✦ Perspektive korrigiert
                 </span>
               )}
+              <span className="text-xs text-muted-foreground px-2.5 py-1 rounded-full bg-muted">
+                {MODES.find(m => m.id === displayMode)?.hint}
+              </span>
             </div>
-            <div className="rounded-2xl overflow-hidden border border-border shadow-sm bg-card max-h-[55vh] flex items-center justify-center">
-              <img src={previewUrl} alt="Scan-Vorschau" className="max-w-full max-h-[55vh] object-contain" style={{ display: "block" }} />
-            </div>
+
             <button onClick={handleSave}
               className="w-full py-4 rounded-2xl text-white text-lg font-semibold flex items-center justify-center gap-2.5 active:scale-[0.97] transition-transform shadow-md"
               style={{ background: "hsl(142 55% 36%)" }}>
@@ -261,8 +294,7 @@ export default function Home() {
             <button onClick={reset}
               className="w-full py-3.5 rounded-2xl bg-muted text-muted-foreground text-base font-medium active:scale-[0.97] transition-transform flex items-center justify-center gap-2">
               <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                <polyline points="1,4 1,10 7,10"/>
-                <path d="M3.51 15a9 9 0 1 0 .49-3.51"/>
+                <polyline points="1,4 1,10 7,10"/><path d="M3.51 15a9 9 0 1 0 .49-3.51"/>
               </svg>
               Neu aufnehmen
             </button>
@@ -270,7 +302,7 @@ export default function Home() {
         )}
 
         {/* ── DONE ── */}
-        {mode === "done" && done && (
+        {appMode === "done" && done && (
           <div className="flex flex-col items-center gap-5 py-6">
             <div className="w-24 h-24 rounded-full flex items-center justify-center shadow-lg"
               style={{ background: "hsl(142 55% 36%)" }}>
@@ -278,21 +310,18 @@ export default function Home() {
                 <polyline points="20,6 9,17 4,12"/>
               </svg>
             </div>
-
             <div className="text-center">
               <p className="text-3xl font-bold text-foreground">Abgelegt</p>
               <p className="text-xs text-muted-foreground mt-2 px-4 font-mono break-all">{done.fileName}</p>
-              {/* folder indicator */}
               <div className="inline-flex items-center gap-1.5 mt-2 px-3 py-1 rounded-full"
                 style={{
                   background: done.folder.startsWith("Prüfen") ? "hsl(45 100% 93%)" : "hsl(142 55% 36% / 0.1)",
-                  color: done.folder.startsWith("Prüfen") ? "hsl(30 80% 35%)" : "hsl(142 55% 28%)",
+                  color:      done.folder.startsWith("Prüfen") ? "hsl(30 80% 35%)"  : "hsl(142 55% 28%)",
                 }}>
                 <span className="text-xs">{done.folder.startsWith("Prüfen") ? "⚠️" : "📁"}</span>
                 <span className="text-xs font-medium">{done.folder}</span>
               </div>
             </div>
-
             <div className="w-full flex flex-col gap-3 mt-1">
               <button onClick={sharePdf}
                 className="w-full py-4 rounded-2xl text-white text-lg font-semibold flex items-center justify-center gap-2.5 active:scale-[0.97] transition-transform shadow-md"
@@ -321,7 +350,7 @@ export default function Home() {
         )}
 
         {/* ── ERROR ── */}
-        {mode === "error" && (
+        {appMode === "error" && (
           <div className="flex flex-col items-center gap-6 py-12">
             <div className="w-24 h-24 rounded-full flex items-center justify-center shadow" style={{ background: "hsl(0 84% 60%)" }}>
               <svg width="44" height="44" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
@@ -342,7 +371,7 @@ export default function Home() {
 
       </main>
 
-      {mode === "idle" && (
+      {appMode === "idle" && (
         <footer className="px-5 pb-6 text-center">
           <p className="text-xs text-muted-foreground">Alles lokal · Kein Server · Kein Konto</p>
         </footer>
