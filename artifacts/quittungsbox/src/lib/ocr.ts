@@ -146,33 +146,24 @@ export async function runOcr(imageBlob: Blob): Promise<OcrResult> {
 }
 
 // ── filename builder ───────────────────────────────────────
-// Full:     YYYY-MM-DD_Lieferant_Betrag_Zahlungsart.pdf
-// Fallback: YYYY-MM-DD_HH-MM_Zahlungsart.pdf  (when vendor+amount both missing)
+// With amount:    YYYY-MM-DD_Betrag_Zahlungsart.pdf
+// Without amount: YYYY-MM-DD_Zahlungsart.pdf
+// Date: from receipt (OCR) or today's scan date as fallback.
 
 export function buildFileName(
   paymentType: "Bar" | "Karte",
-  vendor: string | null,
+  _vendor: string | null,   // kept for API compatibility, not used in filename
   amount: string | null,
   receiptDate: string | null
 ): string {
   const now = new Date();
   const scanDate =
     `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
-  const scanTime =
-    `${String(now.getHours()).padStart(2, "0")}-${String(now.getMinutes()).padStart(2, "0")}`;
 
   const date = receiptDate || scanDate;
 
-  const hasInfo = vendor || amount;
-
-  if (hasInfo) {
-    const parts: string[] = [date];
-    if (vendor) parts.push(vendor);
-    if (amount) parts.push(amount);
-    parts.push(paymentType);
-    return parts.join("_") + ".pdf";
+  if (amount) {
+    return `${date}_${amount}_${paymentType}.pdf`;
   }
-
-  // Fallback: no recognisable fields → add time for uniqueness
-  return `${date}_${scanTime}_${paymentType}.pdf`;
+  return `${date}_${paymentType}.pdf`;
 }
