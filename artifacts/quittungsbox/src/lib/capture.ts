@@ -51,11 +51,22 @@ async function captureWithDocumentScanner(): Promise<CaptureResult | null> {
 
   if (!scannedImages?.length) return null;
 
-  // Capacitor.convertFileSrc() converts a native file:// or content:// path to
-  // a URL that the WebView can load (http://localhost/_capacitor_file_/…).
-  const webUri = Capacitor.convertFileSrc(scannedImages[0]);
+  const filePath = scannedImages[0]; // e.g. file:///data/.../cache/...jpg
 
-  return loadImageToBlob(webUri, true);
+  // Read via Filesystem plugin (most reliable on Android — no WebView CORS issues)
+  try {
+    const { Filesystem } = await import("@capacitor/filesystem");
+    const { data } = await Filesystem.readFile({ path: filePath });
+    const blob = base64ToBlob(
+      typeof data === "string" ? data : await (data as Blob).text(),
+      "image/jpeg"
+    );
+    return { blob, mimeType: "image/jpeg", alreadyCorrected: true };
+  } catch {
+    // Fallback: load via WebView URL
+    const webUri = Capacitor.convertFileSrc(filePath);
+    return loadImageToBlob(webUri, true);
+  }
 }
 
 // ── Plain camera fallback ─────────────────────────────────────────────────────
@@ -108,4 +119,12 @@ function dataUrlToBlob(dataUrl: string): Blob {
   const buffer = new Uint8Array(bytes.length);
   for (let i = 0; i < bytes.length; i++) buffer[i] = bytes.charCodeAt(i);
   return new Blob([buffer], { type: mime });
+}
+
+function base64ToBlob(base64: string, mimeType: string): Blob {
+  const b64 = base64.includes(",") ? base64.split(",")[1] : base64;
+  const bytes  = atob(b64);
+  const buffer = new Uint8Array(bytes.length);
+  for (let i = 0; i < bytes.length; i++) buffer[i] = bytes.charCodeAt(i);
+  return new Blob([buffer], { type: mimeType });
 }
