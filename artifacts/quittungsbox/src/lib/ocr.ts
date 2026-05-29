@@ -62,8 +62,9 @@ const TOTAL_KW = /\b(Total|TOTAL|Betrag|Summe|Rechnungsbetrag|Gesamtbetrag|Gesam
 // Lines that carry quantity / unit prices — amounts here are NOT totals
 const EXCL_KW = /\b(Menge|Anzahl|Liter|Ltr\.?|kg|Stk\.?|Einzel|Grundpreis|Literpreis|Einheitspreis|MWST|MwSt)\b|\bpro\s+(kg|l|Ltr|Stk)\b|\/\s*(kg|l|Ltr)\b|\d+\s*[×xX*]\s*\d/i;
 
-const AMT_RE  = /\b(\d{1,6}[.,]\d{2})\b/;
-const AMT_G   = /\b(\d{1,6}[.,]\d{2})\b/g;
+// Negative lookahead (?![.\-\/]\d) prevents matching "24.05" inside "24.05.2026"
+const AMT_RE  = /\b(\d{1,6}[.,]\d{2})\b(?![.\-\/]\d)/;
+const AMT_G   = /\b(\d{1,6}[.,]\d{2})\b(?![.\-\/]\d)/g;
 
 function parseAmt(s: string): number { return parseFloat(s.replace(",", ".")); }
 
@@ -104,14 +105,8 @@ function extractAmount(text: string): string | null {
   }
   if (allCands.length) return Math.max(...allCands).toFixed(2);
 
-  // ── Pass 4: last resort ──────────────────────────────────────────────────
-  const last: number[] = [];
-  for (const m of text.matchAll(AMT_G)) {
-    const v = parseAmt(m[1]);
-    if (v > 0.01 && v < 100_000) last.push(v);
-  }
-  if (last.length) return Math.max(...last).toFixed(2);
-
+  // No unfiltered fallback — user explicitly prefers no amount over a wrong one.
+  // A garbled or missing total → filename without amount (e.g. 2026-05-24_Karte.pdf).
   return null;
 }
 

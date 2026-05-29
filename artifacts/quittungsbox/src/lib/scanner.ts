@@ -210,40 +210,40 @@ function validateQuad(q: Quad, w: number, h: number): Quad | null {
   return q;
 }
 
-// ── flood-fill: isolate the connected bright region under the image centre ───
-// Receipts are photographed roughly centred. By flood-filling from the nearest
-// bright pixel to the centre we keep only the receipt region and drop other
-// bright objects (table edges, other papers, background walls, etc.).
+// ── largest connected bright component ───────────────────────────────────────
+// Finds the single largest 4-connected region of bright pixels and returns a
+// mask containing only that region.  This is more robust than flood-filling
+// from the image centre because receipts are often not perfectly centred.
+// Assumption: the receipt is the largest bright object in the scene (true when
+// the background is a darker table / mat and the flash/phone light is on).
 
-function floodFillCenter(mask: Uint8Array, w: number, h: number): Uint8Array {
-  const cx = w >> 1, cy = h >> 1;
+function largestBrightComponent(mask: Uint8Array, w: number, h: number): Uint8Array {
+  const n     = w * h;
+  const compOf = new Int32Array(n).fill(-1); // which component each bright pixel belongs to
+  const queue  = new Int32Array(n);          // reused across all BFS passes
+  const sizes: number[] = [];
 
-  // Find bright pixel nearest to centre (sample at stride for speed)
-  const step = Math.max(1, Math.sqrt(w * h) / 200 | 0);
-  let seed = -1, bestD = Infinity;
-  for (let y = 0; y < h; y += step)
-    for (let x = 0; x < w; x += step)
-      if (mask[y*w+x] > 0) {
-        const d = (x-cx)**2 + (y-cy)**2;
-        if (d < bestD) { bestD = d; seed = y*w+x; }
-      }
-
-  if (seed < 0) return mask; // no bright pixels at all → return original
-
-  // BFS from seed pixel
-  const out = new Uint8Array(w * h);
-  const queue = new Int32Array(w * h); // pre-allocated — avoids GC pressure
-  queue[0] = seed; out[seed] = 255;
-  let head = 0, tail = 1;
-  while (head < tail) {
-    const idx = queue[head++];
-    const y = (idx / w) | 0, x = idx % w;
-    // 4-connected neighbours
-    if (y > 0   && mask[idx-w] && !out[idx-w]) { out[idx-w]=255; queue[tail++]=idx-w; }
-    if (y < h-1 && mask[idx+w] && !out[idx+w]) { out[idx+w]=255; queue[tail++]=idx+w; }
-    if (x > 0   && mask[idx-1] && !out[idx-1]) { out[idx-1]=255; queue[tail++]=idx-1; }
-    if (x < w-1 && mask[idx+1] && !out[idx+1]) { out[idx+1]=255; queue[tail++]=idx+1; }
+  for (let i = 0; i < n; i++) {
+    if (!mask[i] || compOf[i] >= 0) continue;
+    const id = sizes.length;
+    sizes.push(0);
+    queue[0] = i; compOf[i] = id;
+    let head = 0, tail = 1;
+    while (head < tail) {
+      const idx = queue[head++];
+      sizes[id]++;
+      const y = (idx / w) | 0, x = idx % w;
+      if (y > 0   && mask[idx-w] && compOf[idx-w] < 0) { compOf[idx-w] = id; queue[tail++] = idx-w; }
+      if (y < h-1 && mask[idx+w] && compOf[idx+w] < 0) { compOf[idx+w] = id; queue[tail++] = idx+w; }
+      if (x > 0   && mask[idx-1] && compOf[idx-1] < 0) { compOf[idx-1] = id; queue[tail++] = idx-1; }
+      if (x < w-1 && mask[idx+1] && compOf[idx+1] < 0) { compOf[idx+1] = id; queue[tail++] = idx+1; }
+    }
   }
+
+  if (!sizes.length) return mask;
+  const largest = sizes.indexOf(Math.max(...sizes));
+  const out = new Uint8Array(n);
+  for (let i = 0; i < n; i++) if (compOf[i] === largest) out[i] = 255;
   return out;
 }
 
@@ -267,8 +267,8 @@ function detectByBrightness(gray: Uint8Array, w: number, h: number): Quad | null
   // Morphological close: fills text/holes inside paper, radius ≈ 6px on 600px canvas
   const closed = morphClose(mask, w, h, 6);
 
-  // Isolate the receipt: keep only the connected bright region under the photo centre
-  const isolated = floodFillCenter(closed, w, h);
+  // Isolate the receipt: keep only the largest connected bright region
+  const isolated = largestBrightComponent(closed, w, h);
 
   return cornersFromMask(isolated, w, h, 200);
 }
