@@ -14,30 +14,36 @@ interface FolderNode {
 }
 
 function buildTree(records: ReceiptRecord[]): FolderNode[] {
-  const roots: Record<string, FolderNode> = {};
+  const roots: FolderNode[] = [];
+  const byPath = new Map<string, FolderNode>();
 
-  for (const r of records) {
-    const parts = r.folder.split("/");
-    let level = roots;
-    let parent: FolderNode | null = null;
+  // Walk/create every folder segment, returning the leaf node for a path.
+  function ensureNode(parts: string[]): FolderNode {
+    let siblings = roots;
+    let node: FolderNode | null = null;
 
     for (let i = 0; i < parts.length; i++) {
-      const seg  = parts[i];
       const path = parts.slice(0, i + 1).join("/");
-      if (!level[seg]) {
-        const node: FolderNode = { label: seg, fullPath: path, receipts: [], children: [] };
-        level[seg] = node;
-        parent?.children.push(node);
-        if (i === 0) roots[seg] = node;
+      let existing = byPath.get(path);
+      if (!existing) {
+        existing = { label: parts[i], fullPath: path, receipts: [], children: [] };
+        byPath.set(path, existing);
+        siblings.push(existing);
       }
-      if (i === parts.length - 1) level[seg].receipts.push(r);
-      // @ts-expect-error – build children map on the fly
-      level = level[seg]._childMap ??= {};
-      parent = level[seg] ?? roots[seg];
+      node = existing;
+      siblings = existing.children;
     }
+
+    return node!;
   }
 
-  return Object.values(roots).sort((a, b) => {
+  for (const r of records) {
+    const parts = r.folder.split("/").filter(Boolean);
+    if (!parts.length) continue;
+    ensureNode(parts).receipts.push(r);
+  }
+
+  return roots.sort((a, b) => {
     if (a.label === "Prüfen") return 1;
     if (b.label === "Prüfen") return -1;
     return a.label.localeCompare(b.label);
